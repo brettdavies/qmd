@@ -13,3 +13,4 @@ texts/
 !docs/solutions/**/*.md
 finetune/outputs/
 finetune/data/train/
+test/vram-ballast
