@@ -3,89 +3,122 @@ timestamp: 2026-02-12 04:16:35
 GPU: NVIDIA GeForce RTX 3090 Ti
 Driver: 570.211.01
 VRAM: 24564 MiB total, 24123 MiB free (clean)
-CUDA: 12.8, V12.8.93
+CUDA toolkit: 12.8, V12.8.93
 Bun: 1.3.9
 node-llama-cpp: 3.14.5
+Prebuilt binaries: b7347
 Model: embeddinggemma-300M-Q8_0.gguf (~307 MiB)
 System: Linux 6.8.0-94-generic, 93 GiB RAM
+Compute capability: 8.6
 ==== END ENVIRONMENT ====
 
-==== NO-BALLAST BASELINE ====
-timestamp: 2026-02-12 04:18:00
+==== CRITICAL FINDING: PREBUILT CUDA BINARY INCOMPATIBLE ====
+timestamp: 2026-02-12 04:34:00
+
+The prebuilt CUDA binary (b7347) is NOT compatible with this system.
+node-llama-cpp silently falls back to Vulkan (AMD iGPU).
+
+Evidence:
+  $ bun -e 'import{getLlama}from"node-llama-cpp";const l=await getLlama();console.log(l.gpu,l.buildType);await l.dispose()'
+  [node-llama-cpp] The prebuilt binary for platform "linux" "x64" with CUDA support
+  is not compatible with the current system, falling back to using Vulkan
+  vulkan prebuilt
+
+Vulkan VRAM state (AMD iGPU, NOT the RTX 3090 Ti):
+  {"total":50699485184,"used":63713280,"free":50635771904}
+  = 50.7 GB total (system RAM via Vulkan), 50.6 GB free
+
+Impact:
+  - ALL previous test runs were using Vulkan, not CUDA
+  - Production `qmd embed` was ALSO using Vulkan since at least Feb 10 (last bun install)
+  - The NVIDIA GPU VRAM pressure from the ballast was irrelevant — model loaded to iGPU/RAM
+  - This explains why no crash was observed: CUDA was never used
+
+Fix:
+  Built CUDA from source by forcing gpu: "cuda" in getLlama():
+  $ bun -e 'import{getLlama}from"node-llama-cpp";const l=await getLlama({gpu:"cuda"});...'
+  [node-llama-cpp] Cloning llama.cpp ... Building from source ...
+  gpu: cuda, build: localBuild, total: 23.56 GB (correct — RTX 3090 Ti)
+
+After local CUDA build, even default getLlama() picks up CUDA (local build takes priority).
+==== END CRITICAL FINDING ====
+
+==== CUDA SWEEP — DEFAULT PADDING (6% / 1 GB cap) ====
+timestamp: 2026-02-12 04:46:14
+backend: CUDA (local build)
 config: percentage=0.06 maxReservedGB=1
-gpu_free: 24123 MiB
-totalVram: 23.56 GB
-padding: 1.00 GB
-gpuLayers: 25 (full offload)
-modelSize: 307.1 MiB
-embedding_dim: 768
-exit: 0 (SUCCESS)
-==== END NO-BALLAST BASELINE ====
 
-==== BALLAST LEVEL SWEEP — DEFAULT PADDING (6% / 1 GB cap) ====
-timestamp: 2026-02-12 04:24:48
-config: percentage=0.06 maxReservedGB=1
+ballast=21856 actual_free=2000 gpuLayers=25 exit=0 SUCCESS
+ballast=22356 actual_free=1500 gpuLayers=24 exit=0 SUCCESS
+ballast=22856 actual_free=1000 gpuLayers=0  exit=0 SUCCESS
+ballast=23056 actual_free=800  gpuLayers=0  exit=0 SUCCESS
+ballast=23256 actual_free=600  gpuLayers=0  exit=0 SUCCESS
+ballast=23456 actual_free=400  gpuLayers=0  exit=0 SUCCESS
+ballast=23556 actual_free=300  gpuLayers=0  exit=0 SUCCESS
 
-ballast=21856 actual_free=2000 nvidia_smi_free=2000 gpuLayers=25 padding=1.00GB exit=0 SUCCESS
-ballast=22356 actual_free=1500 nvidia_smi_free=1500 gpuLayers=24 padding=1.00GB exit=0 SUCCESS
-ballast=22856 actual_free=1000 nvidia_smi_free=1000 gpuLayers=0  padding=1.00GB exit=0 SUCCESS
-ballast=23056 actual_free=800  nvidia_smi_free=800  gpuLayers=0  padding=1.00GB exit=0 SUCCESS
-ballast=23256 actual_free=600  nvidia_smi_free=600  gpuLayers=0  padding=1.00GB exit=0 SUCCESS
-ballast=23456 actual_free=400  nvidia_smi_free=400  gpuLayers=0  padding=1.00GB exit=0 SUCCESS
-ballast=23556 actual_free=300  nvidia_smi_free=300  gpuLayers=0  padding=1.00GB exit=0 SUCCESS
-
-Transition: 25 layers → 24 layers between 2000-1500 MiB
-Transition: 24 layers → 0 layers between 1500-1000 MiB
 No crash at any level.
-==== END DEFAULT PADDING SWEEP ====
+==== END CUDA DEFAULT SWEEP ====
 
-==== BALLAST LEVEL SWEEP — ZERO PADDING ====
-timestamp: 2026-02-12 04:26:03
+==== CUDA SWEEP — ZERO PADDING ====
+timestamp: 2026-02-12 04:47:19
+backend: CUDA (local build)
 config: percentage=0 maxReservedGB=0
 
-ballast=21856 actual_free=2000 nvidia_smi_free=2000 gpuLayers=25 padding=0.00GB exit=0 SUCCESS
-ballast=22356 actual_free=1500 nvidia_smi_free=1500 gpuLayers=25 padding=0.00GB exit=0 SUCCESS
-ballast=22856 actual_free=1000 nvidia_smi_free=1000 gpuLayers=25 padding=0.00GB exit=0 SUCCESS
-ballast=23056 actual_free=800  nvidia_smi_free=800  gpuLayers=25 padding=0.00GB exit=0 SUCCESS
-ballast=23256 actual_free=600  nvidia_smi_free=600  gpuLayers=24 padding=0.00GB exit=0 SUCCESS
-ballast=23456 actual_free=400  nvidia_smi_free=400  gpuLayers=23 padding=0.00GB exit=0 SUCCESS
-ballast=23556 actual_free=300  nvidia_smi_free=300  gpuLayers=0  padding=0.00GB exit=0 SUCCESS
+ballast=21856 actual_free=2000 gpuLayers=25 exit=0 SUCCESS
+ballast=22356 actual_free=1500 gpuLayers=25 exit=0 SUCCESS
+ballast=22856 actual_free=1000 gpuLayers=25 exit=0 SUCCESS
+ballast=23056 actual_free=800  gpuLayers=25 exit=0 SUCCESS
+ballast=23256 actual_free=600  gpuLayers=24 exit=0 SUCCESS
+ballast=23456 actual_free=400  gpuLayers=23 exit=0 SUCCESS
+ballast=23556 actual_free=300  gpuLayers=0  exit=0 SUCCESS
 
-Transition: 25 → 24 layers between 800-600 MiB
-Transition: 24 → 23 layers between 600-400 MiB
-Transition: 23 → 0 layers between 400-300 MiB
 No crash at any level.
-==== END ZERO PADDING SWEEP ====
+==== END CUDA ZERO PADDING SWEEP ====
 
-==== EXTREME PRESSURE — ZERO PADDING ====
-timestamp: 2026-02-12 04:27:36
+==== CUDA TARGETED TEST — 356 MiB FREE, ZERO PADDING ====
+timestamp: 2026-02-12 04:44:00
+backend: CUDA (local build)
 config: percentage=0 maxReservedGB=0
+ballast=23500 actual_free=356 gpuLayers=14 exit=0 SUCCESS
 
-ballast=23600 actual_free=256  gpuLayers=25 exit=0 SUCCESS
-ballast=23650 BALLAST_FAILED (only ~206 MiB free, can't allocate)
-ballast=23700 BALLAST_FAILED
-ballast=23750 BALLAST_FAILED
-ballast=23800 BALLAST_FAILED
-
-Note: At 256 MiB free with zero padding, full GPU offload (25 layers) succeeded.
-Below ~256 MiB, the ballast itself can't allocate (CUDA context overhead).
-==== END EXTREME PRESSURE ====
+At the EXACT crash point from the original investigation (356 MiB free),
+with ZERO padding, the auto algorithm correctly chose partial offload
+(14 of 25 layers) and succeeded. No SIGABRT.
+==== END TARGETED TEST ====
 
 ==== SUMMARY ====
-The SIGABRT crash (exit 134) from the original investigation does NOT reproduce
-with node-llama-cpp 3.14.5 on the current system (CUDA 12.8, driver 570.211.01).
 
-The "auto" GPU layer algorithm now correctly degrades:
-- With default 1 GB padding: falls to 0 layers (CPU) at ≤1000 MiB free
-- With zero padding: gracefully reduces layers (25→24→23→0) as VRAM tightens
-- Even at 256 MiB free with zero padding: full offload succeeds without crash
+1. PREBUILT CUDA BINARY INCOMPATIBLE
+   The prebuilt binary (b7347) silently falls back to Vulkan on this system.
+   Production `qmd embed` has been running on Vulkan (AMD iGPU) since at
+   least Feb 10. This means the original CUDA SIGABRT crash was with a
+   PREVIOUS local CUDA build that no longer exists (lost during bun install).
 
-Possible explanations for the fix:
-1. node-llama-cpp 3.14.5 internal fix (auto algorithm or ggml-cuda error handling)
-2. CUDA driver 570.211.01 improved OOM handling
-3. ggml backend changes between the original crash and now
+2. CRASH DOES NOT REPRODUCE WITH FRESH CUDA BUILD
+   After building CUDA from source (using the llama.cpp bundled with
+   node-llama-cpp 3.14.5), the crash does not reproduce at any VRAM
+   pressure level, even with zero padding.
 
-The original crash was observed running `qmd embed` (production path).
-This test uses the same model URI and getLlama() configuration.
-nvidia-smi and cudaMemGetInfo reported identical free VRAM values (no discrepancy observed).
+3. AUTO ALGORITHM IMPROVED
+   The freshly-built CUDA binary's auto algorithm correctly handles
+   VRAM pressure:
+   - Default padding (1 GB): falls to 0 layers at ≤1000 MiB free
+   - Zero padding: gracefully reduces 25→24→23→14→0 as VRAM shrinks
+   - At 356 MiB free + zero padding: chose 14 layers and succeeded
+
+4. POSSIBLE EXPLANATIONS
+   a) The llama.cpp source bundled with node-llama-cpp 3.14.5 contains
+      fixes to the VRAM estimation/auto algorithm that weren't in the
+      previously-compiled local build
+   b) The previous local build was compiled against a different llama.cpp
+      commit (possibly from an earlier node-llama-cpp version)
+   c) CUDA toolkit 12.8 handles OOM differently than the version used
+      for the previous build
+
+5. PRODUCTION IMPACT
+   Production qmd has been silently running on Vulkan (AMD iGPU/system RAM),
+   not CUDA (NVIDIA GPU). This means:
+   - Embedding performance was degraded (no GPU acceleration)
+   - The SIGABRT crash was masked (Vulkan doesn't hit CUDA OOM)
+   - The fresh CUDA local build will now be used by production
 ==== END SUMMARY ====

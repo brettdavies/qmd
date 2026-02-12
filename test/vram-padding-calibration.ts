@@ -36,6 +36,7 @@ let llama: Awaited<ReturnType<typeof getLlama>> | undefined;
 
 try {
     llama = await getLlama({
+        gpu: "cuda",
         logLevel: LlamaLogLevel.error,
         vramPadding(totalVram) {
             const padding = Math.floor(Math.min(totalVram * percentage, maxReserved));
