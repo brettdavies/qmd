@@ -1,0 +1,91 @@
+==== ENVIRONMENT ====
+timestamp: 2026-02-12 04:16:35
+GPU: NVIDIA GeForce RTX 3090 Ti
+Driver: 570.211.01
+VRAM: 24564 MiB total, 24123 MiB free (clean)
+CUDA: 12.8, V12.8.93
+Bun: 1.3.9
+node-llama-cpp: 3.14.5
+Model: embeddinggemma-300M-Q8_0.gguf (~307 MiB)
+System: Linux 6.8.0-94-generic, 93 GiB RAM
+==== END ENVIRONMENT ====
+
+==== NO-BALLAST BASELINE ====
+timestamp: 2026-02-12 04:18:00
+config: percentage=0.06 maxReservedGB=1
+gpu_free: 24123 MiB
+totalVram: 23.56 GB
+padding: 1.00 GB
+gpuLayers: 25 (full offload)
+modelSize: 307.1 MiB
+embedding_dim: 768
+exit: 0 (SUCCESS)
+==== END NO-BALLAST BASELINE ====
+
+==== BALLAST LEVEL SWEEP — DEFAULT PADDING (6% / 1 GB cap) ====
+timestamp: 2026-02-12 04:24:48
+config: percentage=0.06 maxReservedGB=1
+
+ballast=21856 actual_free=2000 nvidia_smi_free=2000 gpuLayers=25 padding=1.00GB exit=0 SUCCESS
+ballast=22356 actual_free=1500 nvidia_smi_free=1500 gpuLayers=24 padding=1.00GB exit=0 SUCCESS
+ballast=22856 actual_free=1000 nvidia_smi_free=1000 gpuLayers=0  padding=1.00GB exit=0 SUCCESS
+ballast=23056 actual_free=800  nvidia_smi_free=800  gpuLayers=0  padding=1.00GB exit=0 SUCCESS
+ballast=23256 actual_free=600  nvidia_smi_free=600  gpuLayers=0  padding=1.00GB exit=0 SUCCESS
+ballast=23456 actual_free=400  nvidia_smi_free=400  gpuLayers=0  padding=1.00GB exit=0 SUCCESS
+ballast=23556 actual_free=300  nvidia_smi_free=300  gpuLayers=0  padding=1.00GB exit=0 SUCCESS
+
+Transition: 25 layers → 24 layers between 2000-1500 MiB
+Transition: 24 layers → 0 layers between 1500-1000 MiB
+No crash at any level.
+==== END DEFAULT PADDING SWEEP ====
+
+==== BALLAST LEVEL SWEEP — ZERO PADDING ====
+timestamp: 2026-02-12 04:26:03
+config: percentage=0 maxReservedGB=0
+
+ballast=21856 actual_free=2000 nvidia_smi_free=2000 gpuLayers=25 padding=0.00GB exit=0 SUCCESS
+ballast=22356 actual_free=1500 nvidia_smi_free=1500 gpuLayers=25 padding=0.00GB exit=0 SUCCESS
+ballast=22856 actual_free=1000 nvidia_smi_free=1000 gpuLayers=25 padding=0.00GB exit=0 SUCCESS
+ballast=23056 actual_free=800  nvidia_smi_free=800  gpuLayers=25 padding=0.00GB exit=0 SUCCESS
+ballast=23256 actual_free=600  nvidia_smi_free=600  gpuLayers=24 padding=0.00GB exit=0 SUCCESS
+ballast=23456 actual_free=400  nvidia_smi_free=400  gpuLayers=23 padding=0.00GB exit=0 SUCCESS
+ballast=23556 actual_free=300  nvidia_smi_free=300  gpuLayers=0  padding=0.00GB exit=0 SUCCESS
+
+Transition: 25 → 24 layers between 800-600 MiB
+Transition: 24 → 23 layers between 600-400 MiB
+Transition: 23 → 0 layers between 400-300 MiB
+No crash at any level.
+==== END ZERO PADDING SWEEP ====
+
+==== EXTREME PRESSURE — ZERO PADDING ====
+timestamp: 2026-02-12 04:27:36
+config: percentage=0 maxReservedGB=0
+
+ballast=23600 actual_free=256  gpuLayers=25 exit=0 SUCCESS
+ballast=23650 BALLAST_FAILED (only ~206 MiB free, can't allocate)
+ballast=23700 BALLAST_FAILED
+ballast=23750 BALLAST_FAILED
+ballast=23800 BALLAST_FAILED
+
+Note: At 256 MiB free with zero padding, full GPU offload (25 layers) succeeded.
+Below ~256 MiB, the ballast itself can't allocate (CUDA context overhead).
+==== END EXTREME PRESSURE ====
+
+==== SUMMARY ====
+The SIGABRT crash (exit 134) from the original investigation does NOT reproduce
+with node-llama-cpp 3.14.5 on the current system (CUDA 12.8, driver 570.211.01).
+
+The "auto" GPU layer algorithm now correctly degrades:
+- With default 1 GB padding: falls to 0 layers (CPU) at ≤1000 MiB free
+- With zero padding: gracefully reduces layers (25→24→23→0) as VRAM tightens
+- Even at 256 MiB free with zero padding: full offload succeeds without crash
+
+Possible explanations for the fix:
+1. node-llama-cpp 3.14.5 internal fix (auto algorithm or ggml-cuda error handling)
+2. CUDA driver 570.211.01 improved OOM handling
+3. ggml backend changes between the original crash and now
+
+The original crash was observed running `qmd embed` (production path).
+This test uses the same model URI and getLlama() configuration.
+nvidia-smi and cudaMemGetInfo reported identical free VRAM values (no discrepancy observed).
+==== END SUMMARY ====
