@@ -11,6 +11,7 @@ texts/
 !skills/**/*.md
 !finetune/*.md
 !docs/solutions/**/*.md
+!test/**/*.md
 finetune/outputs/
 finetune/data/train/
 test/vram-ballast
