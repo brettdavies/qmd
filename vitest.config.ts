@@ -11,5 +11,10 @@ export default defineConfig({
       // Judge only the .test-d.ts assertions; tsc covers src/ separately.
       ignoreSourceErrors: true,
     },
+    // Unset shell-provided remote-server config so tests stay hermetic and
+    // don't accidentally route through a developer's local `qmd serve`.
+    env: {
+      QMD_REMOTE_URL: "",
+    },
   },
 });
