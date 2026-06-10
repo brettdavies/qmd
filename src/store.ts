@@ -20,8 +20,6 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
 import {
-  LlamaCpp,
-  getDefaultLlamaCpp,
   getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
@@ -33,7 +31,6 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
-import { RemoteLLM } from "./llm-remote.js";
 import type {
   NamedCollection,
   Collection,
@@ -134,23 +131,6 @@ function getLlm(store: Store): LLM {
   return store.llm ?? getDefaultLLM();
 }
 
-/**
- * Narrow an LLM to LlamaCpp for paths that genuinely need the local engine
- * (session management with detokenize, device info). Accepts a real LlamaCpp
- * unconditionally; refuses with a clear message when the active LLM is
- * RemoteLLM so the user knows which operations don't yet route through
- * `qmd serve`; otherwise casts through, since test fixtures routinely pass
- * duck-typed mocks that satisfy neither type.
- */
-function requireLlamaCpp(llm: LLM, op: string): LlamaCpp {
-  if (llm instanceof LlamaCpp) return llm;
-  if (llm instanceof RemoteLLM) {
-    throw new Error(
-      `${op} requires a local LlamaCpp backend; QMD_REMOTE_URL routes that operation through 'qmd serve', which does not yet support it.`,
-    );
-  }
-  return llm as LlamaCpp;
-}
 
 // =============================================================================
 // Smart Chunking - Break Point Detection
@@ -1986,7 +1966,10 @@ export async function generateEmbeddings(
   options?: EmbedOptions
 ): Promise<EmbedResult> {
   const db = store.db;
-  const llm = requireLlamaCpp(getLlm(store), "qmd embed");
+  const llm = getLlm(store);
+  // Remote backends populate model names asynchronously from /health; await so
+  // we tag vectors with the server's actual embedding model, not the default.
+  await llm.ready?.();
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
   const fingerprint = getEmbeddingFingerprint(model);
   const now = new Date().toISOString();
@@ -2606,7 +2589,7 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
 
   const expectedHashSeq = `${sample.hash}_${sample.seq}`;
   const title = extractTitle(sample.body, sample.path);
-  const llm = requireLlamaCpp(getLlm(store), "embedding fingerprint adoption");
+  const llm = getLlm(store);
 
   return await withLLMSessionForLlm(llm, async (session) => {
     const chunks = await chunkDocumentByTokens(sample.body, undefined, undefined, undefined, sample.path, undefined, session.signal);
@@ -3242,7 +3225,7 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  const llm = getDefaultLLM();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -3306,16 +3289,20 @@ export async function chunkDocumentByTokens(
       subChunks.length <= 1
       || subChunks[0]?.text.length === text.length
     ) {
-      const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+      const fallbackTokenCount = Math.max(1, Math.min(tokens.length, maxTokens));
       // Safety net: detokenize() reconstructs text from raw token IDs, and
       // a tokenizer can encode a single astral-plane character across
       // multiple tokens — truncating the token list can land mid-character.
-      const truncatedText = stripUnpairedSurrogates(await llm.detokenize(fallbackTokens));
+      // Remote backends may not expose detokenize; approximate by characters.
+      const rawText = "detokenize" in llm && typeof llm.detokenize === "function"
+        ? await llm.detokenize(tokens.slice(0, fallbackTokenCount))
+        : text.slice(0, Math.max(1, Math.floor(fallbackTokenCount * actualCharsPerToken)));
+      const truncatedText = stripUnpairedSurrogates(rawText);
       if (truncatedText.length === 0) return;
       results.push({
         text: truncatedText,
         pos,
-        tokens: fallbackTokens.length,
+        tokens: fallbackTokenCount,
       });
       return;
     }
