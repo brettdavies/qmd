@@ -124,7 +124,7 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
 
 /**
  * Get the LLM instance for a store — prefers the store's own instance, falls
- * back to the polymorphic global default (LlamaCpp locally, RemoteLLM when
+ * back to the polymorphic global default (LlamaCpp locally, RemoteQMD when
  * QMD_REMOTE_URL is set).
  */
 function getLlm(store: Store): LLM {
@@ -1494,7 +1494,7 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LLM instance for this store (overrides the global singleton). Can be LlamaCpp or RemoteLLM. */
+  /** Optional LLM instance for this store (overrides the global singleton). Can be LlamaCpp or RemoteQMD. */
   llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
