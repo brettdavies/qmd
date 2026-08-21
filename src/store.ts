@@ -4357,27 +4357,37 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
-  // Use a CTE to force FTS5 to run first, then filter by collection.
-  // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
-  // collection filter in a single WHERE clause, which can cause it to
-  // abandon the FTS5 index and fall back to a full scan — turning an 8ms
-  // query into a 17-second query on large collections.
+  // Use a CTE to keep FTS5 driving the query. Without it, SQLite's planner
+  // combines the FTS5 MATCH and the collection filter into a single WHERE
+  // clause, which can make it abandon the FTS5 index and fall back to a full
+  // scan, turning an 8ms query into a 17-second query on large collections.
   const params: (string | number)[] = [ftsQuery];
 
-  // When filtering by collection or metadata, fetch extra candidates from the
-  // FTS index since some will be filtered out. Without a filter we can fetch
-  // exactly the requested limit. Selective filters remain best-effort: an
-  // eligible document outside this candidate window is missed (same
-  // completeness contract as collection filtering).
-  const ftsLimit = (collectionFilter || filter) ? limit * 10 : limit;
+  // Scope the FTS lookup itself with a rowid prefilter instead of taking a
+  // global top-N and dropping the out-of-scope rows afterwards. The over-fetch
+  // this replaces (limit * 10 candidates when scoped) could not make a
+  // post-filter correct, it only moved the cutoff: a collection holding a
+  // small share of the index still lost every row whenever the global top-N
+  // happened to contain none of its documents, and the caller got an empty
+  // result that reads as "this collection has nothing on the subject".
+  //
+  // documents_fts.rowid is documents.id, so the subquery is a covering-index
+  // read on idx_documents_collection and the MATCH still runs against the FTS5
+  // index (EXPLAIN QUERY PLAN: SCAN documents_fts VIRTUAL TABLE INDEX 0:=M3),
+  // which is what the CTE above exists to protect.
+  let scopeFilter = "";
+  if (collectionFilter) {
+    scopeFilter = `\n        AND rowid IN (SELECT id FROM documents WHERE active = 1 AND collection = ?)`;
+    params.push(String(collectionFilter));
+  }
 
-  let sql = `
+  const sql = `
     WITH fts_matches AS (
       SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
       FROM documents_fts
-      WHERE documents_fts MATCH ?
+      WHERE documents_fts MATCH ?${scopeFilter}
       ORDER BY bm25_score ASC
-      LIMIT ${ftsLimit}
+      LIMIT ${limit}
     )
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
@@ -4392,23 +4402,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     JOIN content ON content.hash = d.hash
     LEFT JOIN document_metadata dm ON dm.document_id = d.id
     WHERE d.active = 1
+    ORDER BY fm.bm25_score ASC
+    LIMIT ?
   `;
 
-  if (collectionFilter) {
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionFilter));
-  }
-
-  if (filter) {
-    // Only documents with current, error-free extraction can match — an
-    // unprocessed document must not accidentally satisfy `exists: false`.
-    const compiledFilter = compileMetadataFilter(filter, "d");
-    sql += ` AND dm.extraction_version = ${METADATA_EXTRACTION_VERSION} AND dm.extraction_error IS NULL AND ${compiledFilter.sql}`;
-    params.push(...compiledFilter.params);
-  }
-
   // bm25 lower is better; sort ascending.
-  sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
   params.push(limit);
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number; metadata_json: string | null }[];
