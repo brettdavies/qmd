@@ -4357,57 +4357,87 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
-  // Use a CTE to keep FTS5 driving the query. Without it, SQLite's planner
-  // combines the FTS5 MATCH and the collection filter into a single WHERE
-  // clause, which can make it abandon the FTS5 index and fall back to a full
-  // scan, turning an 8ms query into a 17-second query on large collections.
+  // Two SQL shapes, chosen by whether a collection scope is present, because
+  // the correct-and-fast plan differs:
+  //
+  //   Unscoped: the FTS5 MATCH is the whole answer, so bound the CTE with the
+  //   requested LIMIT and let FTS5 early-terminate once the top-N are settled.
+  //
+  //   Scoped: the collection filter must be applied to a COMPLETE match set,
+  //   never to a pre-truncated one. A LIMIT inside the CTE (the earlier
+  //   `limit * 10` over-fetch) is a correctness bug: a collection holding a
+  //   small share of the index loses every row whenever the global top-N holds
+  //   none of its documents, and the caller gets an empty result that reads as
+  //   "this collection has nothing on the subject". But the obvious correct
+  //   form, pushing the collection into the CTE as a
+  //   `rowid IN (SELECT id FROM documents WHERE collection = ?)` prefilter,
+  //   defeats FTS5 early termination: SQLite drives the query from the
+  //   collection's whole doclist and probes the FTS5 index once per candidate
+  //   rowid (EXPLAIN: `... VIRTUAL TABLE INDEX 0:=M3`), which measured about
+  //   55ms per in-scope document, 0.02s unscoped versus 21s scoped to a large
+  //   collection.
+  //
+  //   So the scoped shape keeps the MATCH global and unbounded, MATERIALIZEs
+  //   the complete match set once (corpus-bounded, at most one row per matching
+  //   document), and applies the collection filter, ORDER BY and LIMIT in the
+  //   outer query. MATERIALIZED is load-bearing: without it the planner may
+  //   flatten the CTE and fold the collection predicate back into the MATCH,
+  //   reintroducing exactly the per-rowid plan this avoids.
+
   const params: (string | number)[] = [ftsQuery];
 
-  // Scope the FTS lookup itself with a rowid prefilter instead of taking a
-  // global top-N and dropping the out-of-scope rows afterwards. The over-fetch
-  // this replaces (limit * 10 candidates when scoped) could not make a
-  // post-filter correct, it only moved the cutoff: a collection holding a
-  // small share of the index still lost every row whenever the global top-N
-  // happened to contain none of its documents, and the caller got an empty
-  // result that reads as "this collection has nothing on the subject".
-  //
-  // documents_fts.rowid is documents.id, so the subquery is a covering-index
-  // read on idx_documents_collection and the MATCH still runs against the FTS5
-  // index (EXPLAIN QUERY PLAN: SCAN documents_fts VIRTUAL TABLE INDEX 0:=M3),
-  // which is what the CTE above exists to protect.
-  let scopeFilter = "";
+  let sql: string;
   if (collectionFilter) {
-    scopeFilter = `\n        AND rowid IN (SELECT id FROM documents WHERE active = 1 AND collection = ?)`;
-    params.push(String(collectionFilter));
+    sql = `
+      WITH fts_matches AS MATERIALIZED (
+        SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
+        FROM documents_fts
+        WHERE documents_fts MATCH ?
+      )
+      SELECT
+        'qmd://' || d.collection || '/' || d.path as filepath,
+        d.collection || '/' || d.path as display_path,
+        d.title,
+        substr(content.doc, 1, 262144) as body,
+        d.hash,
+        fm.bm25_score,
+        dm.metadata_json
+      FROM fts_matches fm
+      JOIN documents d ON d.id = fm.rowid
+      JOIN content ON content.hash = d.hash
+      LEFT JOIN document_metadata dm ON dm.document_id = d.id
+      WHERE d.active = 1 AND d.collection = ?
+      ORDER BY fm.bm25_score ASC
+      LIMIT ?
+    `;
+    params.push(String(collectionFilter), limit);
+  } else {
+    sql = `
+      WITH fts_matches AS (
+        SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
+        FROM documents_fts
+        WHERE documents_fts MATCH ?
+        ORDER BY bm25_score ASC
+        LIMIT ${limit}
+      )
+      SELECT
+        'qmd://' || d.collection || '/' || d.path as filepath,
+        d.collection || '/' || d.path as display_path,
+        d.title,
+        substr(content.doc, 1, 262144) as body,
+        d.hash,
+        fm.bm25_score,
+        dm.metadata_json
+      FROM fts_matches fm
+      JOIN documents d ON d.id = fm.rowid
+      JOIN content ON content.hash = d.hash
+      LEFT JOIN document_metadata dm ON dm.document_id = d.id
+      WHERE d.active = 1
+      ORDER BY fm.bm25_score ASC
+      LIMIT ?
+    `;
+    params.push(limit);
   }
-
-  const sql = `
-    WITH fts_matches AS (
-      SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
-      FROM documents_fts
-      WHERE documents_fts MATCH ?${scopeFilter}
-      ORDER BY bm25_score ASC
-      LIMIT ${limit}
-    )
-    SELECT
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
-      d.title,
-      substr(content.doc, 1, 262144) as body,
-      d.hash,
-      fm.bm25_score,
-      dm.metadata_json
-    FROM fts_matches fm
-    JOIN documents d ON d.id = fm.rowid
-    JOIN content ON content.hash = d.hash
-    LEFT JOIN document_metadata dm ON dm.document_id = d.id
-    WHERE d.active = 1
-    ORDER BY fm.bm25_score ASC
-    LIMIT ?
-  `;
-
-  // bm25 lower is better; sort ascending.
-  params.push(limit);
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number; metadata_json: string | null }[];
   return rows.map(row => {
