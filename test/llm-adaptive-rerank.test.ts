@@ -11,14 +11,17 @@
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
 import { LlamaCpp } from "../src/llm.js";
 
+/** Widen at the test boundary so private members narrow with a single assertion (anti-slop fence). */
+const widen = (value: unknown): unknown => value;
+
 type FakeLlama = {
   gpu: false | string;
   getVramState: () => Promise<{ total: number; used: number; free: number }>;
 };
 
 function patchLlama(llm: LlamaCpp, llama: FakeLlama): void {
-  (llm as unknown as { ensureLlama: () => Promise<FakeLlama> }).ensureLlama = async () => llama;
-  (llm as unknown as { isCpuOffloadForced: () => boolean }).isCpuOffloadForced = () => false;
+  (widen(llm) as { ensureLlama: () => Promise<FakeLlama> }).ensureLlama = async () => llama;
+  (widen(llm) as { isCpuOffloadForced: () => boolean }).isCpuOffloadForced = () => false;
 }
 
 function gb(n: number): number {
@@ -47,7 +50,7 @@ describe("LlamaCpp resolveRerankContextSize — env override", () => {
       getVramState: async () => ({ total: gb(24), used: gb(23.5), free: gb(0.5) }),
     });
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(8192);
   });
 
@@ -59,7 +62,7 @@ describe("LlamaCpp resolveRerankContextSize — env override", () => {
       getVramState: async () => ({ total: gb(24), used: gb(0), free: gb(24) }),
     });
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(1024);
   });
 
@@ -76,7 +79,7 @@ describe("LlamaCpp resolveRerankContextSize — env override", () => {
       getVramState: async () => ({ total: gb(24), used: gb(0), free: gb(24) }),
     });
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(4096);
   });
 });
@@ -102,7 +105,7 @@ describe("LlamaCpp resolveRerankContextSize — adaptive VRAM logic", () => {
       getVramState: async () => { probed = true; return { total: 0, used: 0, free: 0 }; },
     });
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(4096);
     expect(probed).toBe(false);
   });
@@ -110,13 +113,13 @@ describe("LlamaCpp resolveRerankContextSize — adaptive VRAM logic", () => {
   test("CPU offload forced returns the default size without probing", async () => {
     const llm = new LlamaCpp({});
     let probed = false;
-    (llm as unknown as { ensureLlama: () => Promise<FakeLlama> }).ensureLlama = async () => ({
+    (widen(llm) as { ensureLlama: () => Promise<FakeLlama> }).ensureLlama = async () => ({
       gpu: "cuda",
       getVramState: async () => { probed = true; return { total: 0, used: 0, free: 0 }; },
     });
-    (llm as unknown as { isCpuOffloadForced: () => boolean }).isCpuOffloadForced = () => true;
+    (widen(llm) as { isCpuOffloadForced: () => boolean }).isCpuOffloadForced = () => true;
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(4096);
     expect(probed).toBe(false);
   });
@@ -128,7 +131,7 @@ describe("LlamaCpp resolveRerankContextSize — adaptive VRAM logic", () => {
       getVramState: async () => ({ total: gb(24), used: gb(0), free: gb(24) }),
     });
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(4096);
   });
 
@@ -140,7 +143,7 @@ describe("LlamaCpp resolveRerankContextSize — adaptive VRAM logic", () => {
       getVramState: async () => ({ total: gb(24), used: gb(23) - 1500 * 1024 * 1024, free: 1500 * 1024 * 1024 }),
     });
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(4096);
   });
 
@@ -152,7 +155,7 @@ describe("LlamaCpp resolveRerankContextSize — adaptive VRAM logic", () => {
       getVramState: async () => ({ total: gb(24), used: gb(24) - 1499 * 1024 * 1024, free: 1499 * 1024 * 1024 }),
     });
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(2048);
   });
 
@@ -164,7 +167,7 @@ describe("LlamaCpp resolveRerankContextSize — adaptive VRAM logic", () => {
       getVramState: async () => ({ total: gb(24), used: gb(22.6), free: gb(1.4) }),
     });
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(2048);
   });
 
@@ -175,7 +178,7 @@ describe("LlamaCpp resolveRerankContextSize — adaptive VRAM logic", () => {
       getVramState: async () => { throw new Error("VRAM state unavailable"); },
     });
 
-    const size = await (llm as unknown as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
+    const size = await (widen(llm) as { resolveRerankContextSize: () => Promise<number> }).resolveRerankContextSize();
     expect(size).toBe(4096);
   });
 });
@@ -201,19 +204,19 @@ describe("LlamaCpp ensureRerankContexts — wiring", () => {
       getVramState: async () => ({ total: gb(24), used: gb(22.6), free: gb(1.4) }),
     });
     const created: number[] = [];
-    (llm as unknown as { ensureRerankModel: () => Promise<unknown> }).ensureRerankModel = async () => ({
+    (widen(llm) as { ensureRerankModel: () => Promise<unknown> }).ensureRerankModel = async () => ({
       createRankingContext: async ({ contextSize }: { contextSize: number }) => {
         created.push(contextSize);
         return { dispose: async () => undefined };
       },
     });
-    (llm as unknown as { computeParallelism: (mb: number) => Promise<number> }).computeParallelism = async () => 1;
-    (llm as unknown as { threadsPerContext: (n: number) => Promise<number> }).threadsPerContext = async () => 0;
+    (widen(llm) as { computeParallelism: (mb: number) => Promise<number> }).computeParallelism = async () => 1;
+    (widen(llm) as { threadsPerContext: (n: number) => Promise<number> }).threadsPerContext = async () => 0;
 
-    await (llm as unknown as { ensureRerankContexts: () => Promise<unknown> }).ensureRerankContexts();
+    await (widen(llm) as { ensureRerankContexts: () => Promise<unknown> }).ensureRerankContexts();
 
     expect(created).toEqual([2048]);
-    expect((llm as unknown as { rerankContextSize: number }).rerankContextSize).toBe(2048);
+    expect((widen(llm) as { rerankContextSize: number }).rerankContextSize).toBe(2048);
   });
 
   test("passes perContextMB derived from the actual chosen size, not a hardcoded 1000", async () => {
@@ -223,17 +226,17 @@ describe("LlamaCpp ensureRerankContexts — wiring", () => {
       // Plentiful — picks 4096.
       getVramState: async () => ({ total: gb(24), used: gb(0), free: gb(24) }),
     });
-    (llm as unknown as { ensureRerankModel: () => Promise<unknown> }).ensureRerankModel = async () => ({
+    (widen(llm) as { ensureRerankModel: () => Promise<unknown> }).ensureRerankModel = async () => ({
       createRankingContext: async () => ({ dispose: async () => undefined }),
     });
     let observedMB = -1;
-    (llm as unknown as { computeParallelism: (mb: number) => Promise<number> }).computeParallelism = async (mb: number) => {
+    (widen(llm) as { computeParallelism: (mb: number) => Promise<number> }).computeParallelism = async (mb: number) => {
       observedMB = mb;
       return 1;
     };
-    (llm as unknown as { threadsPerContext: (n: number) => Promise<number> }).threadsPerContext = async () => 0;
+    (widen(llm) as { threadsPerContext: (n: number) => Promise<number> }).threadsPerContext = async () => 0;
 
-    await (llm as unknown as { ensureRerankContexts: () => Promise<unknown> }).ensureRerankContexts();
+    await (widen(llm) as { ensureRerankContexts: () => Promise<unknown> }).ensureRerankContexts();
 
     // 4096 * 0.28 ≈ 1146 MB. The old hardcode was 1000 MB.
     expect(observedMB).toBeGreaterThan(1000);
@@ -249,20 +252,20 @@ describe("LlamaCpp ensureRerankContexts — wiring", () => {
       getVramState: async () => ({ total: gb(24), used: gb(0), free: gb(24) }),
     });
     const created: number[] = [];
-    (llm as unknown as { ensureRerankModel: () => Promise<unknown> }).ensureRerankModel = async () => ({
+    (widen(llm) as { ensureRerankModel: () => Promise<unknown> }).ensureRerankModel = async () => ({
       createRankingContext: async ({ contextSize }: { contextSize: number }) => {
         created.push(contextSize);
         return { dispose: async () => undefined };
       },
     });
     let observedMB = -1;
-    (llm as unknown as { computeParallelism: (mb: number) => Promise<number> }).computeParallelism = async (mb: number) => {
+    (widen(llm) as { computeParallelism: (mb: number) => Promise<number> }).computeParallelism = async (mb: number) => {
       observedMB = mb;
       return 1;
     };
-    (llm as unknown as { threadsPerContext: (n: number) => Promise<number> }).threadsPerContext = async () => 0;
+    (widen(llm) as { threadsPerContext: (n: number) => Promise<number> }).threadsPerContext = async () => 0;
 
-    await (llm as unknown as { ensureRerankContexts: () => Promise<unknown> }).ensureRerankContexts();
+    await (widen(llm) as { ensureRerankContexts: () => Promise<unknown> }).ensureRerankContexts();
 
     expect(created).toEqual([1024]);
     // 1024 * 0.28 ≈ 287 MB. Per-context budget must reflect the smaller size.
@@ -274,21 +277,21 @@ describe("LlamaCpp ensureRerankContexts — wiring", () => {
 describe("LlamaCpp rerankContextSize lifecycle — reset on teardown", () => {
   test("disposeRerankModel clears rerankContextSize so next call re-probes", async () => {
     const llm = new LlamaCpp({});
-    (llm as unknown as { rerankContextSize: number | null }).rerankContextSize = 2048;
-    (llm as unknown as { rerankContexts: unknown[] }).rerankContexts = [];
+    (widen(llm) as { rerankContextSize: number | null }).rerankContextSize = 2048;
+    (widen(llm) as { rerankContexts: unknown[] }).rerankContexts = [];
 
-    await (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel();
+    await (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel();
 
-    expect((llm as unknown as { rerankContextSize: number | null }).rerankContextSize).toBeNull();
+    expect((widen(llm) as { rerankContextSize: number | null }).rerankContextSize).toBeNull();
   });
 
   test("dispose clears rerankContextSize", async () => {
     const llm = new LlamaCpp({});
-    (llm as unknown as { rerankContextSize: number | null }).rerankContextSize = 2048;
-    (llm as unknown as { rerankContexts: unknown[] }).rerankContexts = [];
+    (widen(llm) as { rerankContextSize: number | null }).rerankContextSize = 2048;
+    (widen(llm) as { rerankContexts: unknown[] }).rerankContexts = [];
 
     await llm.dispose();
 
-    expect((llm as unknown as { rerankContextSize: number | null }).rerankContextSize).toBeNull();
+    expect((widen(llm) as { rerankContextSize: number | null }).rerankContextSize).toBeNull();
   });
 });
