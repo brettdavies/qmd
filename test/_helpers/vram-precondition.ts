@@ -50,7 +50,8 @@ let loggedOnce = false;
 
 async function defaultGetLlama(): Promise<LlamaLike> {
   const mod = await import("node-llama-cpp");
-  return await mod.getLlama() as unknown as LlamaLike;
+  const llama: unknown = await mod.getLlama();
+  return llama as LlamaLike;
 }
 
 /**
