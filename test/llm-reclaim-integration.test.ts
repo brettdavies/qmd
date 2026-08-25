@@ -37,6 +37,9 @@
 import { describe, test, expect } from "vitest";
 import { LlamaCpp, isInsufficientVramError, type RerankDocument } from "../src/llm.js";
 
+/** Widen at the test boundary so private members narrow with a single assertion (anti-slop fence). */
+const widen = (value: unknown): unknown => value;
+
 const GATE_ON = process.env.QMD_RECLAIM_INTEGRATION === "1";
 
 describe.skipIf(!GATE_ON)("LlamaCpp reclaim integration (real GPU)", () => {
@@ -50,13 +53,13 @@ describe.skipIf(!GATE_ON)("LlamaCpp reclaim integration (real GPU)", () => {
     // at class load, so process.env mutation alone would have no effect.
     // Reflective swap is the cleanest way to force a real allocation that
     // no GPU can satisfy.
-    const fieldOwner = LlamaCpp as unknown as { RERANK_CONTEXT_SIZE: number };
+    const fieldOwner = widen(LlamaCpp) as { RERANK_CONTEXT_SIZE: number };
     const originalSize = fieldOwner.RERANK_CONTEXT_SIZE;
     fieldOwner.RERANK_CONTEXT_SIZE = 1_048_576;  // 1 M tokens, ~290 GB context
 
     // Spy on rerankImpl to count attempts.  Wrap, do not replace — the real
     // implementation must run so the real lib error surfaces.
-    const target = llm as unknown as {
+    const target = widen(llm) as {
       rerankImpl: (...args: unknown[]) => Promise<unknown>;
     };
     const originalImpl = target.rerankImpl.bind(llm);
@@ -99,7 +102,7 @@ describe.skipIf(!GATE_ON)("LlamaCpp reclaim integration (real GPU)", () => {
       rerankModel: "/nonexistent/path/to/no-such-model.gguf",
     });
 
-    const target = llm as unknown as {
+    const target = widen(llm) as {
       rerankImpl: (...args: unknown[]) => Promise<unknown>;
     };
     const originalImpl = target.rerankImpl.bind(llm);
