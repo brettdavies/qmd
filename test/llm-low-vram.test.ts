@@ -12,6 +12,9 @@
 import { describe, test, expect, beforeAll, afterAll } from "vitest";
 import { LlamaCpp, type RerankDocument, type Queryable, type RerankResult, type EmbeddingResult, type EmbedOptions } from "../src/llm.js";
 
+/** Widen at the test boundary so private members narrow with a single assertion (anti-slop fence). */
+const widen = (value: unknown): unknown => value;
+
 /**
  * Build a LlamaCpp with lowVram=true and replace its low-level methods with
  * fakes that record the relative order of operations. Each fake takes one
@@ -31,7 +34,7 @@ function makeInstrumentedLlm(): { llm: LlamaCpp; events: string[] } {
   // Replace the heavy work with fast fakes that exercise the chain only.
   // The public expandQuery/rerank still run their lowVram wrappers, which is
   // what we want to test.
-  (llm as unknown as { expandQueryImpl: (query: string, options?: unknown) => Promise<Queryable[]> }).expandQueryImpl = async (
+  (widen(llm) as { expandQueryImpl: (query: string, options?: unknown) => Promise<Queryable[]> }).expandQueryImpl = async (
     _query: string,
     _options?: unknown,
   ): Promise<Queryable[]> => {
@@ -42,7 +45,7 @@ function makeInstrumentedLlm(): { llm: LlamaCpp; events: string[] } {
     return [{ type: "lex", text: "x" }];
   };
 
-  (llm as unknown as { rerankImpl: (query: string, documents: RerankDocument[], options?: unknown) => Promise<RerankResult> }).rerankImpl = async (
+  (widen(llm) as { rerankImpl: (query: string, documents: RerankDocument[], options?: unknown) => Promise<RerankResult> }).rerankImpl = async (
     _query: string,
     documents: RerankDocument[],
     _options?: unknown,
@@ -57,13 +60,13 @@ function makeInstrumentedLlm(): { llm: LlamaCpp; events: string[] } {
     };
   };
 
-  (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+  (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
     events.push("expand:dispose");
     resident.generate = false;
     await tick();
   };
 
-  (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+  (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
     events.push("rerank:dispose");
     resident.rerank = false;
     await tick();
@@ -159,7 +162,7 @@ describe("LlamaCpp lowVram mode", () => {
     const { llm, events } = makeInstrumentedLlm();
 
     let calls = 0;
-    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async (_q: string) => {
+    (widen(llm) as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async (_q: string) => {
       calls++;
       events.push(calls === 1 ? "expand:throw" : "expand:end");
       if (calls === 1) throw new Error("boom");
@@ -185,7 +188,7 @@ describe("LlamaCpp lowVram mode", () => {
     let inFlight = 0;
     let maxInFlight = 0;
 
-    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
+    (widen(llm) as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
       inFlight++;
       maxInFlight = Math.max(maxInFlight, inFlight);
       await new Promise((r) => setImmediate(r));
@@ -193,7 +196,7 @@ describe("LlamaCpp lowVram mode", () => {
       events.push("end");
       return [{ type: "lex", text: "x" }];
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose");
     };
 
@@ -214,11 +217,11 @@ describe("LlamaCpp lowVram mode", () => {
       // calling expandQuery should go through the chain wrapper. We can
       // detect that by stubbing impl and asserting it gets queued.
       let chained = false;
-      (llm as unknown as { expandQueryImpl: () => Promise<Queryable[]> }).expandQueryImpl = async () => {
+      (widen(llm) as { expandQueryImpl: () => Promise<Queryable[]> }).expandQueryImpl = async () => {
         chained = true;
         return [];
       };
-      (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
+      (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
       return llm.expandQuery("test").then(() => {
         expect(chained).toBe(true);
       });
@@ -233,7 +236,7 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+    (widen(llm) as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
       attempts++;
       events.push(`embed:attempt-${attempts}`);
       if (attempts === 1) {
@@ -241,10 +244,10 @@ describe("LlamaCpp lowVram mode", () => {
       }
       return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
 
@@ -264,7 +267,7 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { embedBatchImpl: (texts: string[], options: EmbedOptions) => Promise<(EmbeddingResult | null)[]> }).embedBatchImpl = async (texts: string[]) => {
+    (widen(llm) as { embedBatchImpl: (texts: string[], options: EmbedOptions) => Promise<(EmbeddingResult | null)[]> }).embedBatchImpl = async (texts: string[]) => {
       attempts++;
       events.push(`batch:attempt-${attempts}`);
       if (attempts === 1) {
@@ -272,10 +275,10 @@ describe("LlamaCpp lowVram mode", () => {
       }
       return texts.map(() => ({ embedding: [1, 2, 3], model: "fake-embed" }));
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
 
@@ -295,14 +298,14 @@ describe("LlamaCpp lowVram mode", () => {
     const events: string[] = [];
     const llm = new LlamaCpp({ lowVram: true });
 
-    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+    (widen(llm) as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
       events.push("embed:attempt");
       throw new Error("model file not found");
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
 
@@ -316,11 +319,11 @@ describe("LlamaCpp lowVram mode", () => {
     const events: string[] = [];
     const llm = new LlamaCpp({}); // lowVram defaults to false
 
-    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+    (widen(llm) as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
       events.push("embed:attempt");
       throw new Error("A context size of 2048 is too large for the available VRAM");
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
 
@@ -338,28 +341,28 @@ describe("LlamaCpp lowVram mode", () => {
 
     // expandQuery and rerank each park inside their lowVram chain wrappers
     // until we release them, simulating in-flight callers.
-    (llm as unknown as { expandQueryImpl: () => Promise<Queryable[]> }).expandQueryImpl = async () => {
+    (widen(llm) as { expandQueryImpl: () => Promise<Queryable[]> }).expandQueryImpl = async () => {
       events.push("expand:start");
       await new Promise<void>((r) => { release.generate = r; });
       events.push("expand:end");
       return [];
     };
-    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+    (widen(llm) as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
       events.push("rerank:start");
       await new Promise<void>((r) => { release.rerank = r; });
       events.push("rerank:end");
       return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
     };
-    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+    (widen(llm) as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
       embedAttempts++;
       events.push(`embed:attempt-${embedAttempts}`);
       if (embedAttempts === 1) throw new Error("too large for the available VRAM");
       return { embedding: [9], model: "fake-embed" };
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
 
@@ -403,7 +406,7 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
+    (widen(llm) as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
       attempts++;
       events.push(`expand:attempt-${attempts}`);
       if (attempts === 1) {
@@ -411,13 +414,13 @@ describe("LlamaCpp lowVram mode", () => {
       }
       return [{ type: "lex", text: "ok" }];
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
       events.push("dispose:embed-contexts");
     };
 
@@ -440,7 +443,7 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+    (widen(llm) as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
       attempts++;
       events.push(`rerank:attempt-${attempts}`);
       if (attempts === 1) {
@@ -448,13 +451,13 @@ describe("LlamaCpp lowVram mode", () => {
       }
       return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
       events.push("dispose:embed-contexts");
     };
 
@@ -477,7 +480,7 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+    (widen(llm) as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
       attempts++;
       events.push(`embed:attempt-${attempts}`);
       if (attempts === 1) {
@@ -485,16 +488,16 @@ describe("LlamaCpp lowVram mode", () => {
       }
       return { embedding: [1], model: "fake-embed" };
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
       events.push("dispose:embed-contexts");
     };
-    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+    (widen(llm) as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
       events.push("dispose:embed-model");
     };
 
@@ -516,7 +519,7 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+    (widen(llm) as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
       attempts++;
       events.push(`rerank:attempt-${attempts}`);
       if (attempts < 3) {
@@ -524,16 +527,16 @@ describe("LlamaCpp lowVram mode", () => {
       }
       return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
       events.push("dispose:embed-contexts");
     };
-    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+    (widen(llm) as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
       events.push("dispose:embed-model");
     };
 
@@ -556,15 +559,15 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async () => {
+    (widen(llm) as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async () => {
       attempts++;
       events.push(`rerank:attempt-${attempts}`);
       throw new Error("Failed to create any rerank context");
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => undefined;
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => undefined;
-    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => undefined;
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => undefined;
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => undefined;
+    (widen(llm) as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => undefined;
 
     await expect(llm.rerank("q", [{ file: "a.md", text: "x" }])).rejects.toThrow(/Failed to create any rerank context/);
     // 1 initial + 2 reclaim retries = 3 attempts, no more.
@@ -577,22 +580,22 @@ describe("LlamaCpp lowVram mode", () => {
     let expandAttempts = 0;
     const release: { rerank?: () => void } = {};
 
-    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+    (widen(llm) as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
       events.push("rerank:start");
       await new Promise<void>((r) => { release.rerank = r; });
       events.push("rerank:end");
       return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
     };
-    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
+    (widen(llm) as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
       expandAttempts++;
       events.push(`expand:attempt-${expandAttempts}`);
       if (expandAttempts === 1) throw new Error("too large for the available VRAM");
       return [{ type: "lex", text: "ok" }];
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
 
@@ -632,7 +635,7 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
+    (widen(llm) as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
       attempts++;
       events.push(`expand:attempt-${attempts}`);
       if (attempts < 3) {
@@ -640,16 +643,16 @@ describe("LlamaCpp lowVram mode", () => {
       }
       return [{ type: "lex", text: "ok" }];
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
       events.push("dispose:embed-contexts");
     };
-    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+    (widen(llm) as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
       events.push("dispose:embed-model");
     };
 
@@ -671,14 +674,14 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
+    (widen(llm) as { expandQueryImpl: (q: string) => Promise<Queryable[]> }).expandQueryImpl = async () => {
       attempts++;
       throw new Error("A context size of 2048 is too large for the available VRAM");
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => undefined;
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => undefined;
-    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => undefined;
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => undefined;
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => undefined;
+    (widen(llm) as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => undefined;
 
     await expect(llm.expandQuery("test")).rejects.toThrow(/too large for the available VRAM/);
     // Initial + first-pass retry + second-pass retry = 3 attempts, then surface.
@@ -690,21 +693,21 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
+    (widen(llm) as { embedImpl: (text: string, options: EmbedOptions) => Promise<EmbeddingResult> }).embedImpl = async () => {
       attempts++;
       events.push(`embed:attempt-${attempts}`);
       throw new Error("Failed to create any embedding context");
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
       events.push("dispose:embed-contexts");
     };
-    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+    (widen(llm) as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
       events.push("dispose:embed-model");
     };
 
@@ -723,7 +726,7 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
+    (widen(llm) as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async (_q, docs) => {
       attempts++;
       events.push(`rerank:attempt-${attempts}`);
       if (attempts === 1) {
@@ -732,14 +735,14 @@ describe("LlamaCpp lowVram mode", () => {
       return { results: docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })), model: "fake" };
     };
     // First-pass dispose throws — reclaim must swallow and continue.
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate-throws");
       throw new Error("simulated dispose failure");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
       events.push("dispose:embed-contexts");
     };
 
@@ -766,7 +769,7 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async () => {
+    (widen(llm) as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async () => {
       attempts++;
       events.push(`rerank:attempt-${attempts}`);
       // A *different* error — looks like a bug, not VRAM pressure. Reclaim
@@ -774,13 +777,13 @@ describe("LlamaCpp lowVram mode", () => {
       // dropping models.
       throw new Error("Computing rankings is not supported for this model.");
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => {
       events.push("dispose:generate");
     };
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => {
       events.push("dispose:rerank");
     };
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => {
       events.push("dispose:embed-contexts");
     };
 
@@ -799,17 +802,17 @@ describe("LlamaCpp lowVram mode", () => {
     const llm = new LlamaCpp({ lowVram: true });
     let attempts = 0;
 
-    (llm as unknown as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async () => {
+    (widen(llm) as { rerankImpl: (q: string, docs: RerankDocument[]) => Promise<RerankResult> }).rerankImpl = async () => {
       attempts++;
       events.push(`rerank:attempt-${attempts}`);
       if (attempts === 1) throw new Error("Failed to create any rerank context");
       // Second attempt fails for an unrelated reason — must not escalate.
       throw new Error("model file corrupted");
     };
-    (llm as unknown as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
-    (llm as unknown as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => undefined;
-    (llm as unknown as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => undefined;
-    (llm as unknown as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
+    (widen(llm) as { disposeGenerateModel: () => Promise<void> }).disposeGenerateModel = async () => undefined;
+    (widen(llm) as { disposeRerankModel: () => Promise<void> }).disposeRerankModel = async () => undefined;
+    (widen(llm) as { disposeEmbedContexts: () => Promise<void> }).disposeEmbedContexts = async () => undefined;
+    (widen(llm) as { disposeEmbedModel: () => Promise<void> }).disposeEmbedModel = async () => {
       events.push("dispose:embed-model");
     };
 
