@@ -13,6 +13,7 @@
 
 import { openDatabase, loadSqliteVec } from "./db.js";
 import {
+  PartitionWriter,
   VEC_COLLECTION_IDS_TABLE,
   VEC_ROWS_TABLE,
   VEC_TABLE,
@@ -22,6 +23,7 @@ import {
   deleteCollectionId,
   deletePartitionRows,
   hasVectorIndex,
+  missingPartitionRows,
   partitionRowKey,
   renameCollectionId,
   resolveCollectionId,
@@ -1778,6 +1780,8 @@ export type EmbedProgress = {
 export type EmbedResult = {
   docsProcessed: number;
   chunksEmbedded: number;
+  /** Chunks copied into the partition of a collection that gained an already-embedded hash. */
+  chunksCopied: number;
   /** Active failed chunks that did not recover after retries. */
   errors: number;
   failures?: EmbedFailure[];
@@ -2011,10 +2015,11 @@ export async function generateEmbeddings(
     clearAllEmbeddings(db, options?.collection);
   }
 
+  const chunksCopied = copyVectorsToNewCollections(db, options?.collection).copied;
   const docsToEmbed = getPendingEmbeddingDocs(db, options?.collection, model);
 
   if (docsToEmbed.length === 0) {
-    return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
+    return { docsProcessed: 0, chunksEmbedded: 0, chunksCopied, errors: 0, durationMs: 0 };
   }
   const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
   const totalDocs = docsToEmbed.length;
@@ -2189,19 +2194,30 @@ export async function generateEmbeddings(
 
         try {
           const embeddings = await session.embedBatch(texts, { model });
-          for (let i = 0; i < chunkBatch.length; i++) {
-            const chunk = chunkBatch[i]!;
-            const embedding = embeddings[i];
-            if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
-              chunksEmbedded++;
-              successesSinceRetry++;
-              clearFailure(chunk);
-            } else {
-              recordFailure(chunk, "batch embedding returned no vector");
+          // One IMMEDIATE transaction per batch: every chunk writes several
+          // rows across three tables, and a kill mid-batch must not leave
+          // them out of step. Failure bookkeeping runs after the commit.
+          const stored: ChunkItem[] = [];
+          const unembedded: ChunkItem[] = [];
+          db.transaction(() => {
+            for (let i = 0; i < chunkBatch.length; i++) {
+              const chunk = chunkBatch[i]!;
+              const embedding = embeddings[i];
+              if (embedding) {
+                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+                stored.push(chunk);
+              } else {
+                unembedded.push(chunk);
+              }
             }
-            batchChunkBytesProcessed += chunk.bytes;
+          }).immediate();
+          for (const chunk of stored) {
+            chunksEmbedded++;
+            successesSinceRetry++;
+            clearFailure(chunk);
           }
+          for (const chunk of unembedded) recordFailure(chunk, "batch embedding returned no vector");
+          batchChunkBytesProcessed += chunkBatch.reduce((sum, chunk) => sum + chunk.bytes, 0);
           await retryFailedChunks();
         } catch (error) {
           // Batch failed — try individual embeddings as fallback. If an
@@ -2250,6 +2266,7 @@ export async function generateEmbeddings(
   return {
     docsProcessed: totalDocs,
     chunksEmbedded: result.chunksEmbedded,
+    chunksCopied,
     errors: result.errors,
     failures: result.failures,
     durationMs: Date.now() - startTime,
@@ -4521,6 +4538,44 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
       db.exec(`DROP TABLE IF EXISTS ${VEC_TABLE}`);
     }
   });
+}
+
+/**
+ * Give every active (hash, collection) pair whose chunks are embedded a row
+ * in that collection's partition, copied from any partition that holds the
+ * chunk, so a hash that gains a collection is searchable there without
+ * another model call. A chunk no partition holds is queued for embedding by
+ * deleting its hash's rows, which the pending detector then picks up.
+ */
+export function copyVectorsToNewCollections(db: Database, collection?: string): { copied: number; queued: number } {
+  const layout = vecLayout(db);
+  if (layout.kind === "legacy" || !isSqliteVecAvailable()) return { copied: 0, queued: 0 };
+  return withLazyContentVectorMigration(db, () => db.transaction(() => {
+    const missing = missingPartitionRows(db, collection);
+    if (missing.length === 0) return { copied: 0, queued: 0 };
+    const writer = layout.kind === "partitioned" ? new PartitionWriter(db) : null;
+    const sourceOf = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = ? LIMIT 1`);
+    const vectorOf = writer ? db.prepare(`SELECT embedding FROM ${VEC_TABLE} WHERE rowid = ?`) : null;
+    const queued = new Set<string>();
+    let copied = 0;
+    for (const row of missing) {
+      if (queued.has(row.hash)) continue;
+      const source = sourceOf.get(row.hash, row.seq) as { id: number } | undefined;
+      const vector = source && vectorOf ? (vectorOf.get(vecInteger(source.id)) as { embedding: Uint8Array } | undefined) : undefined;
+      if (!vector || !writer) {
+        queued.add(row.hash);
+        continue;
+      }
+      if (writer.writeToCollection(row.hash, row.seq, row.collection, vector.embedding)) copied++;
+    }
+    const partitionRowsOf = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ?`);
+    const deleteChunks = db.prepare(`DELETE FROM content_vectors WHERE hash = ?`);
+    for (const hash of queued) {
+      deletePartitionRows(db, (partitionRowsOf.all(hash) as { id: number }[]).map((row) => row.id));
+      deleteChunks.run(hash);
+    }
+    return { copied, queued: queued.size };
+  }).immediate());
 }
 
 /**

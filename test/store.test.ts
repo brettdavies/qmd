@@ -4965,6 +4965,143 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings copies vectors to a collection that gained an embedded hash instead of embedding again", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      const first = await createTestCollection({ name: "first", pwd: "/test/first" });
+      const second = await createTestCollection({ name: "second", pwd: "/test/second" });
+      await insertTestDocument(db, first, { name: "shared", hash: "sharedhash", body: "# Shared\n\nShared body", displayPath: "shared.md" });
+      const embedded = await generateEmbeddings(store);
+      expect(embedded.chunksEmbedded).toBe(1);
+      expect(embedded.chunksCopied).toBe(0);
+
+      await insertTestDocument(db, second, { name: "copy", hash: "sharedhash", body: "# Shared\n\nShared body", displayPath: "copy.md" });
+      expect(await store.searchVec("ignored", "test-model", 5, second, undefined, [1, 2, 3])).toEqual([]);
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
+
+      const result = await generateEmbeddings(store);
+
+      expect(fakeLlm.embedBatchCalls).toHaveLength(1);
+      expect(result.chunksCopied).toBe(1);
+      expect(result.chunksEmbedded).toBe(0);
+      const found = await store.searchVec("ignored", "test-model", 5, second, undefined, [1, 2, 3]);
+      expect(found.map((r) => r.displayPath)).toEqual([`${second}/copy.md`]);
+      expect((await store.searchVec("ignored", "test-model", 5, first, undefined, [1, 2, 3])).map((r) => r.displayPath)).toEqual([`${first}/shared.md`]);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings embeds a hash again when no partition holds its vector", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      const docs = await createTestCollection({ name: "docs", pwd: "/test/docs" });
+      await insertTestDocument(db, docs, { name: "lost", hash: "losthash", body: "# Lost\n\nLost body", displayPath: "lost.md" });
+      await generateEmbeddings(store);
+      const rows = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE}`).all() as { id: number }[];
+      expect(rows).toHaveLength(1);
+      deletePartitionRows(db, rows.map((row) => row.id));
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
+
+      const result = await generateEmbeddings(store);
+
+      expect(fakeLlm.embedBatchCalls).toHaveLength(2);
+      expect(result.chunksEmbedded).toBe(1);
+      expect(result.chunksCopied).toBe(0);
+      expect((await store.searchVec("ignored", "test-model", 5, docs, undefined, [1, 2, 3])).map((r) => r.hash)).toEqual(["losthash"]);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings writes a batch in one transaction and rolls it back when a chunk write fails", async () => {
+    const store = await createTestStore();
+    const real = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+    const doomed = "doomedhash";
+    const observed = { inserted: [] as string[], insideTransaction: [] as boolean[], firstHashRowsAfterRollback: -1 };
+    const rowsOf = (hash: string) => (real.prepare(`SELECT COUNT(*) AS c FROM content_vectors WHERE hash = ?`).get(hash) as { c: number }).c;
+    const guard = <T extends (...args: any[]) => unknown>(run: T): T => ((...args: unknown[]) => {
+      try {
+        return run(...args);
+      } catch (error) {
+        // The failing write unwinds an inner savepoint first; sample once the
+        // outermost transaction has rolled back.
+        if (!(real as any).inTransaction && observed.firstHashRowsAfterRollback < 0 && observed.inserted.length > 0) {
+          observed.firstHashRowsAfterRollback = rowsOf(observed.inserted[0]!);
+        }
+        throw error;
+      }
+    }) as T;
+    const failingDb = {
+      prepare: (sql: string) => {
+        const stmt = real.prepare(sql);
+        if (!sql.includes("INSERT OR REPLACE INTO content_vectors")) return stmt;
+        return {
+          run: (...params: any[]) => {
+            if (params[0] === doomed) throw new Error("injected write failure");
+            observed.inserted.push(params[0]);
+            observed.insideTransaction.push((real as any).inTransaction);
+            return stmt.run(...params);
+          },
+          get: (...params: any[]) => stmt.get(...params),
+          all: (...params: any[]) => stmt.all(...params),
+          iterate: (...params: any[]) => stmt.iterate(...params),
+        };
+      },
+      transaction: (fn: any) => {
+        const tx = real.transaction(fn);
+        const wrapped = guard(tx) as any;
+        wrapped.immediate = guard(tx.immediate);
+        return wrapped;
+      },
+      exec: (sql: string) => real.exec(sql),
+      loadExtension: (path: string) => real.loadExtension(path),
+      close: () => real.close(),
+    };
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+    store.db = failingDb as any;
+
+    try {
+      await insertTestDocument(real, "docs", { name: "one", hash: "onehash", body: "# One\n\nAlpha" });
+      await insertTestDocument(real, "docs", { name: "two", hash: doomed, body: "# Two\n\nBeta" });
+      await insertTestDocument(real, "docs", { name: "three", hash: "threehash", body: "# Three\n\nGamma" });
+
+      const result = await generateEmbeddings(store);
+
+      expect(fakeLlm.embedBatchCalls).toHaveLength(1);
+      expect(observed.inserted[0]).toBe("onehash");
+      expect(observed.insideTransaction.every(Boolean)).toBe(true);
+      expect(observed.firstHashRowsAfterRollback).toBe(0);
+      expect(result.errors).toBe(1);
+      expect(result.failures?.[0]?.hash).toBe(doomed);
+      expect(rowsOf(doomed)).toBe(0);
+      expect(rowsOf("onehash")).toBe(1);
+      expect(rowsOf("threehash")).toBe(1);
+      expect(store.getHashesNeedingEmbedding()).toBe(1);
+    } finally {
+      store.db = real;
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
   test("generateEmbeddings rejects invalid batch limits", async () => {
     const store = await createTestStore();
 
