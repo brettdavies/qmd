@@ -57,6 +57,7 @@ import {
   insertDocument,
   cleanupOrphanedVectors,
   clearAllEmbeddings,
+  maybeAdoptLegacyEmbeddingFingerprint,
   removeCollection,
   renameCollection,
   generateEmbeddings,
@@ -5062,6 +5063,112 @@ describe("Embedding batching", () => {
       expect(store.getHashesNeedingEmbedding()).toBe(1);
     } finally {
       store.db = real;
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("cleanupOrphanedVectors after re-indexing a changed file removes the stale rows that starve a scoped search", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const near = [1, 0, 0];
+    const far = [0, 1, 0];
+    const embeddingFor = (text: string) => ({ embedding: text.includes("stale") ? near : far, model: "fake-embed" });
+    const fakeLlm = {
+      async embed(text: string, _options?: { model?: string }) { return embeddingFor(text); },
+      async embedBatch(texts: string[], _options?: { model?: string }) { return texts.map(embeddingFor); },
+    };
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+    const dir = await mkdtemp(join(tmpdir(), "qmd-stale-vectors-"));
+
+    try {
+      await writeFile(join(dir, "live.md"), "# Live\n\nlive body\n");
+      const versions = ["stale 0", "stale 1", "stale 2", "stale 3", "final body"];
+      for (const body of versions) {
+        await writeFile(join(dir, "churn.md"), `# Churn\n\n${body}\n`);
+        await reindexCollection(store, dir, "**/*.md", "docs");
+        await generateEmbeddings(store);
+      }
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM documents WHERE active = 1`).get()).toEqual({ c: 2 });
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE}`).get()).toEqual({ c: 6 });
+
+      // Four stale rows sit nearer the query than both live documents: with
+      // limit 1 every one of the scoped KNN's three slots goes to a row no
+      // active document owns, and the search comes back empty.
+      expect(await store.searchVec("ignored", "test-model", 1, "docs", undefined, near)).toEqual([]);
+
+      expect(cleanupOrphanedVectors(db)).toBe(4);
+
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE}`).get()).toEqual({ c: 2 });
+      const after = await store.searchVec("ignored", "test-model", 1, "docs", undefined, near);
+      expect(after).toHaveLength(1);
+      expect(await store.searchVec("ignored", "test-model", 5, "docs", undefined, near)).toHaveLength(2);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("maybeAdoptLegacyEmbeddingFingerprint finds the sample's stored vector through the partition mapping", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const model = "hf:test/embed-model.gguf";
+    const stored = [0.1, 0.2, 0.3];
+    const fakeLlm = {
+      embedModelName: model,
+      async embed(_text: string, _options?: { model?: string }) { return { embedding: stored, model }; },
+      async embedBatch(texts: string[], _options?: { model?: string }) { return texts.map(() => ({ embedding: stored, model })); },
+    };
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      const docs = await createTestCollection({ name: "docs", pwd: "/test/docs" });
+      await insertTestDocument(db, docs, { name: "legacy", hash: "legacyhash", body: "# Legacy\n\nLegacy body", displayPath: "legacy.md" });
+      store.ensureVecTable(3);
+      store.insertEmbedding("legacyhash", 0, 0, new Float32Array(stored), model, new Date().toISOString(), 1, "");
+      expect(store.getHashesNeedingEmbedding(model)).toBe(1);
+
+      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, model);
+
+      expect(result).toMatchObject({ checked: true, adopted: 1 });
+      expect(result.reason).toContain("legacyhash_0");
+      expect(store.getHashesNeedingEmbedding(model)).toBe(0);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("maybeAdoptLegacyEmbeddingFingerprint keeps a legacy fingerprint whose sample no longer matches", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const model = "hf:test/embed-model.gguf";
+    const fakeLlm = {
+      embedModelName: model,
+      async embed(_text: string, _options?: { model?: string }) { return { embedding: [0.3, 0.2, 0.1], model }; },
+      async embedBatch(texts: string[], _options?: { model?: string }) { return texts.map(() => ({ embedding: [0.3, 0.2, 0.1], model })); },
+    };
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      const docs = await createTestCollection({ name: "docs", pwd: "/test/docs" });
+      await insertTestDocument(db, docs, { name: "legacy", hash: "legacyhash", body: "# Legacy\n\nLegacy body", displayPath: "legacy.md" });
+      store.ensureVecTable(3);
+      store.insertEmbedding("legacyhash", 0, 0, new Float32Array([0.1, 0.2, 0.3]), model, new Date().toISOString(), 1, "");
+
+      const result = await maybeAdoptLegacyEmbeddingFingerprint(store, model);
+
+      expect(result).toMatchObject({ checked: true, adopted: 0 });
+      expect(result.reason).toContain("nearest legacyhash_0");
+      expect(store.getHashesNeedingEmbedding(model)).toBe(1);
+    } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
     }
