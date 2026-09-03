@@ -17,6 +17,8 @@ import YAML from "yaml";
 import type { CollectionConfig } from "../src/collections";
 import { setConfigIndexName } from "../src/collections";
 import { syncConfigToDb } from "../src/store";
+import { VEC_TABLE, createVectorMetadataTables, vecLayout } from "../src/vec-layout";
+import { migrateVectorLayout } from "../src/store-migrations";
 
 // =============================================================================
 // Test Database Setup
@@ -124,8 +126,10 @@ function initTestDatabase(db: Database): void {
       value TEXT
     )
   `);
+  createVectorMetadataTables(db);
 }
 
+/** Seeds the legacy vector table, then runs the layout migration on it. */
 function seedTestData(db: Database): void {
   const now = new Date().toISOString();
 
@@ -188,6 +192,8 @@ function seedTestData(db: Database): void {
     db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, embedded_at) VALUES (?, 0, 0, ?, ?, ?)`).run(doc.hash, DEFAULT_EMBED_MODEL, getEmbeddingFingerprint(DEFAULT_EMBED_MODEL), now);
     db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${doc.hash}_0`, embedding);
   }
+  expect(migrateVectorLayout(db, { sqliteVecAvailable: true })).toBe("applied");
+  expect(vecLayout(db)).toMatchObject({ kind: "partitioned", dimensions: 768 });
 }
 
 // =============================================================================
@@ -342,6 +348,7 @@ describe("MCP Server", () => {
       const emptyDb = openDatabase(":memory:");
       initTestDatabase(emptyDb);
       emptyDb.exec("DROP TABLE IF EXISTS vectors_vec");
+      emptyDb.exec(`DROP TABLE IF EXISTS ${VEC_TABLE}`);
 
       const results = await searchVec(emptyDb, "test", DEFAULT_EMBED_MODEL, 10);
       expect(results.length).toBe(0);
