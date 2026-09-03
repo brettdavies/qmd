@@ -2238,6 +2238,9 @@ async function vectorIndex(
 
     const totalTimeSec = result.durationMs / 1000;
 
+    if (result.chunksCopied > 0) {
+      console.log(`${c.green}✓${c.reset} Copied ${formatCount(result.chunksCopied)} vectors into collections that gained already-embedded documents`);
+    }
     if (result.chunksEmbedded === 0 && result.docsProcessed === 0) {
       console.log(`${c.green}✓ No non-empty documents to embed.${c.reset}`);
     } else {
