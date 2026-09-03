@@ -12,6 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+import { createVectorMetadataTables } from "./vec-layout.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
@@ -1253,6 +1254,7 @@ function initializeDatabase(db: Database): void {
   `);
 
   ensureContentVectorsStatusIndex(db);
+  createVectorMetadataTables(db);
 
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
