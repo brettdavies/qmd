@@ -7,6 +7,18 @@
 - Added Oxlint lint fence.
 - Document metadata and metadata filtering. Markdown documents can opt into typed metadata through a namespaced frontmatter block (`qmd.metadata` with strings, numbers, booleans, or flat homogeneous arrays), and every search surface — CLI `search`/`vsearch`/`query` via `--filter <json>`, the SDK's `filter` option on `search()`/`searchLex()`/`searchVector()`, the MCP `query` tool, and HTTP `POST /query` and `/search` — accepts one shared recursive filter AST discriminated by `operator`: `and`/`or`/`not` logical groups, `eq`/`ne`/`gt`/`gte`/`lt`/`lte` comparisons, `in`/`nin`/`all` membership, and `exists` presence. Every returned result satisfies the filter (applied before RRF fusion and reranking); like collection filtering, highly selective filters remain best-effort for top-K completeness. Frontmatter stays ordinary searchable content — no chunking, embedding, snippet, or line-number changes — and documents without `qmd.metadata` behave exactly as before. JSON/SDK/MCP/HTTP results now include each document's indexed metadata, and `qmd status` reports how many documents still need metadata extraction (a normal `qmd update` backfills existing indexes).
 
+### Changed
+
+- `qmd cleanup` repacks the vector table when fewer than 90% of its chunk
+  reads hold live rows. vec0 fills the first free slot of its newest chunk
+  and reclaims a chunk only once it is empty, so re-embeds and orphan removal
+  leave holes in older chunks that every brute-force scan still reads; a
+  794k-vector index at 36% occupancy scanned twice as slowly as a packed copy
+  of the same rows. The repack moves the live rows of each mostly-empty chunk
+  to the tail, one chunk per short transaction, so it never holds the write
+  lock for long and an interrupted run leaves a consistent table. The cleanup
+  output and `qmd cleanup --dry-run` report the chunk counts.
+
 ### Fixed
 
 - Embedding generation and legacy fingerprint adoption now tokenize documents
