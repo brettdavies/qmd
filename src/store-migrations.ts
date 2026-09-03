@@ -17,12 +17,11 @@
 import type { Database } from "./db.js";
 import {
   LEGACY_VEC_TABLE,
+  PartitionWriter,
   VEC_ROWS_TABLE,
   VEC_TABLE,
-  allocateCollectionId,
   createPartitionedVecTable,
   missingPartitionRows,
-  vecInteger,
   vecLayout,
   vecTableReadable,
   type ReadableVecLayout,
@@ -112,45 +111,6 @@ function writeCursor(db: Database, chunkId: number): void {
     .run(CURSOR_KEY, String(chunkId));
 }
 
-/** Writes one vector under every active collection of its hash; returns the rows inserted. */
-class PartitionWriter {
-  private readonly ids = new Map<string, number>();
-  private readonly collectionsOf;
-  private readonly insertRow;
-  private readonly insertVec;
-
-  constructor(private readonly db: Database) {
-    this.collectionsOf = db.prepare(`SELECT DISTINCT collection FROM documents WHERE hash = ? AND active = 1`);
-    this.insertRow = db.prepare(`INSERT OR IGNORE INTO ${VEC_ROWS_TABLE} (hash, seq, collection_id) VALUES (?, ?, ?)`);
-    this.insertVec = db.prepare(`INSERT INTO ${VEC_TABLE} (rowid, collection_id, embedding) VALUES (?, ?, ?)`);
-  }
-
-  private idOf(collection: string): number {
-    let id = this.ids.get(collection);
-    if (id === undefined) {
-      id = allocateCollectionId(this.db, collection);
-      this.ids.set(collection, id);
-    }
-    return id;
-  }
-
-  writeToCollection(hash: string, seq: number, collection: string, embedding: Uint8Array): boolean {
-    const id = this.idOf(collection);
-    const inserted = this.insertRow.run(hash, seq, id);
-    if (inserted.changes === 0) return false;
-    this.insertVec.run(vecInteger(inserted.lastInsertRowid), vecInteger(id), embedding);
-    return true;
-  }
-
-  writeToActiveCollections(hash: string, seq: number, embedding: Uint8Array): number {
-    let written = 0;
-    for (const row of this.collectionsOf.all(hash) as { collection: string }[]) {
-      if (this.writeToCollection(hash, seq, row.collection, embedding)) written++;
-    }
-    return written;
-  }
-}
-
 function copyLegacyChunks(
   db: Database,
   legacy: ReadableVecLayout,
@@ -166,7 +126,7 @@ function copyLegacyChunks(
   let copied = 0;
 
   const copyOne = db.transaction((): boolean => {
-    if (getUserVersion(db) >= VECTOR_PARTITION_VERSION) return false;
+    if (vecLayout(db).kind !== "legacy") return false;
     const chunk = nextChunk.get(readCursor(db)) as Omit<LegacyChunk, "vectors"> | undefined;
     if (!chunk) return false;
     const blob = (vectorsOf.get(chunk.chunkId) as { vectors: Uint8Array } | undefined)?.vectors;
@@ -197,7 +157,7 @@ function copyLegacyChunks(
 function copyStragglers(db: Database, legacy: ReadableVecLayout): void {
   const legacyVector = db.prepare(`SELECT embedding FROM ${legacy.table} WHERE hash_seq = ?`);
   db.transaction(() => {
-    if (getUserVersion(db) >= VECTOR_PARTITION_VERSION) return;
+    if (vecLayout(db).kind !== "legacy") return;
     const writer = new PartitionWriter(db);
     for (const missing of missingPartitionRows(db)) {
       const row = legacyVector.get(`${missing.hash}_${missing.seq}`) as { embedding: Uint8Array } | undefined;
@@ -219,9 +179,9 @@ export function deleteVectorlessContentVectors(db: Database): number {
 
 function flipToPartitioned(db: Database): void {
   db.transaction(() => {
-    if (getUserVersion(db) >= VECTOR_PARTITION_VERSION) return;
+    if (vecLayout(db).kind !== "legacy") return;
     db.prepare(`DELETE FROM store_config WHERE key = ?`).run(CURSOR_KEY);
-    db.exec(`PRAGMA user_version = ${VECTOR_PARTITION_VERSION}`);
+    db.exec(`PRAGMA user_version = ${Math.max(getUserVersion(db), VECTOR_PARTITION_VERSION)}`);
     db.exec(`DROP TABLE IF EXISTS ${LEGACY_VEC_TABLE}`);
   }).immediate();
 }
@@ -245,10 +205,11 @@ function ensurePartitionedTable(db: Database, dimensions: number): void {
 /**
  * The version 2 step. Returns "deferred" when the legacy table cannot be read
  * because sqlite-vec is not loaded: the version stays behind and the next open
- * with the extension retries, while FTS keeps working.
+ * with the extension retries, while FTS keeps working. The step keys on the
+ * legacy table rather than the version so that a legacy table an older build
+ * created on an already-stamped database is copied too.
  */
 export function migrateVectorLayout(db: Database, options: VectorMigrationOptions): VectorMigrationResult {
-  if (getUserVersion(db) >= VECTOR_PARTITION_VERSION) return "applied";
   const layout = vecLayout(db);
   if (layout.kind !== "legacy") {
     applyVersionedStep(db, VECTOR_PARTITION_VERSION, () => {});
@@ -268,7 +229,7 @@ export function migrateVectorLayout(db: Database, options: VectorMigrationOption
 
   ensurePartitionedTable(db, dimensions);
   copyLegacyChunks(db, layout, dimensions, (copied) => report("copy", copied));
-  if (getUserVersion(db) < VECTOR_PARTITION_VERSION) {
+  if (vecLayout(db).kind === "legacy") {
     report("verify", total);
     copyStragglers(db, layout);
     deleteVectorlessContentVectors(db);

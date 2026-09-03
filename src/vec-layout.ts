@@ -175,6 +175,87 @@ export function rowidList(rowids: readonly number[]): string {
   return JSON.stringify(rowids);
 }
 
+/** Deletes vector rows by rowid from the vec0 table (when it exists) and the mapping. */
+export function deletePartitionRows(db: Database, rowids: readonly number[]): void {
+  if (rowids.length === 0) return;
+  const deleteVec = hasVectorIndex(db) ? db.prepare(`DELETE FROM ${VEC_TABLE} WHERE rowid = ?`) : null;
+  const deleteRow = db.prepare(`DELETE FROM ${VEC_ROWS_TABLE} WHERE id = ?`);
+  for (const id of rowids) {
+    deleteVec?.run(vecInteger(id));
+    deleteRow.run(id);
+  }
+}
+
+/**
+ * Replace or insert the vector of (hash, seq) in one collection's partition.
+ * vec0 ignores OR REPLACE, so an existing row is deleted and its rowid reused.
+ */
+export function upsertPartitionVector(db: Database, hash: string, seq: number, collectionId: number, embedding: Float32Array | Uint8Array): void {
+  const existing = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = ? AND collection_id = ?`)
+    .get(hash, seq, collectionId) as { id: number } | undefined;
+  let rowid: number;
+  if (existing) {
+    db.prepare(`DELETE FROM ${VEC_TABLE} WHERE rowid = ?`).run(vecInteger(existing.id));
+    rowid = existing.id;
+  } else {
+    rowid = Number(db.prepare(`INSERT INTO ${VEC_ROWS_TABLE} (hash, seq, collection_id) VALUES (?, ?, ?)`).run(hash, seq, collectionId).lastInsertRowid);
+  }
+  db.prepare(`INSERT INTO ${VEC_TABLE} (rowid, collection_id, embedding) VALUES (?, ?, ?)`).run(vecInteger(rowid), vecInteger(collectionId), embedding);
+}
+
+/** Bulk writer that inserts a vector under a collection unless that partition row exists. */
+export class PartitionWriter {
+  private readonly ids = new Map<string, number>();
+  private readonly collectionsOf;
+  private readonly insertRow;
+  private readonly insertVec;
+
+  constructor(private readonly db: Database) {
+    this.collectionsOf = db.prepare(`SELECT DISTINCT collection FROM documents WHERE hash = ? AND active = 1`);
+    this.insertRow = db.prepare(`INSERT OR IGNORE INTO ${VEC_ROWS_TABLE} (hash, seq, collection_id) VALUES (?, ?, ?)`);
+    this.insertVec = db.prepare(`INSERT INTO ${VEC_TABLE} (rowid, collection_id, embedding) VALUES (?, ?, ?)`);
+  }
+
+  private idOf(collection: string): number {
+    let id = this.ids.get(collection);
+    if (id === undefined) {
+      id = allocateCollectionId(this.db, collection);
+      this.ids.set(collection, id);
+    }
+    return id;
+  }
+
+  /** True when a row was written; false when the partition already held (hash, seq). */
+  writeToCollection(hash: string, seq: number, collection: string, embedding: Uint8Array | Float32Array): boolean {
+    const id = this.idOf(collection);
+    const inserted = this.insertRow.run(hash, seq, id);
+    if (inserted.changes === 0) return false;
+    this.insertVec.run(vecInteger(inserted.lastInsertRowid), vecInteger(id), embedding);
+    return true;
+  }
+
+  writeToActiveCollections(hash: string, seq: number, embedding: Uint8Array | Float32Array): number {
+    let written = 0;
+    for (const row of this.collectionsOf.all(hash) as { collection: string }[]) {
+      if (this.writeToCollection(hash, seq, row.collection, embedding)) written++;
+    }
+    return written;
+  }
+}
+
+/** Stored vector bytes of (hash, seq) from whichever partition holds it. */
+export function storedEmbedding(db: Database, hash: string, seq: number): Uint8Array | undefined {
+  const row = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = ? LIMIT 1`).get(hash, seq) as { id: number } | undefined;
+  if (!row) return undefined;
+  const stored = db.prepare(`SELECT embedding FROM ${VEC_TABLE} WHERE rowid = ?`).get(vecInteger(row.id)) as { embedding: Uint8Array } | undefined;
+  return stored?.embedding;
+}
+
+/** (hash, seq) behind a vec0 rowid. */
+export function partitionRowKey(db: Database, rowid: number): { hash: string; seq: number } | undefined {
+  return db.prepare(`SELECT hash, seq FROM ${VEC_ROWS_TABLE} WHERE id = ?`).get(rowid) as { hash: string; seq: number } | undefined;
+}
+
 export type MissingPartitionRow = { hash: string; seq: number; collection: string };
 
 /**
