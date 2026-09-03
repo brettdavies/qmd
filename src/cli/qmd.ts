@@ -56,6 +56,7 @@ import {
   deactivateDocument,
   getActiveDocumentPaths,
   cleanupOrphanedContent,
+  cleanupOrphanedVectors,
   countOrphanedVectors,
   previewCleanup,
   runCleanup,
@@ -529,14 +530,6 @@ function sanitizeDiagnosticMessage(message: string): string {
     .filter(Boolean)
     .slice(0, 3)
     .join("; ");
-}
-
-/** Hint after `qmd update` when orphaned embedding chunks exceed this share of vectors (#768). */
-const ORPHAN_VECTOR_HINT_RATIO = 0.1;
-
-function formatOrphanedVectorHint(orphaned: number, total: number): string {
-  const pct = total > 0 ? Math.round((orphaned / total) * 100) : 0;
-  return `${orphaned} orphaned embedding chunks (${pct}% of vectors) — run 'qmd cleanup' to reclaim space`;
 }
 
 async function showStatus(): Promise<void> {
@@ -1019,18 +1012,22 @@ async function updateCollections(): Promise<void> {
     console.log("");
   }
 
+  // A changed file rewrites its document's hash in place, which strands the
+  // old hash's rows in the collection's vector partition; the partition
+  // filter cannot see documents.active, so those rows would take k slots
+  // from a scoped search until they are removed.
+  const staleVectors = cleanupOrphanedVectors(db);
+
   // Check if any documents need embedding (show once at end)
   const needsEmbedding = getHashesNeedingEmbedding(db);
-  const vectorTotal = (db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number }).count;
-  const orphanedVectors = countOrphanedVectors(db);
   closeDb();
 
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
+  if (staleVectors > 0) {
+    console.log(`Removed ${staleVectors} stale vector row(s)`);
+  }
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
-  }
-  if (vectorTotal > 0 && orphanedVectors / vectorTotal >= ORPHAN_VECTOR_HINT_RATIO) {
-    console.log(`\n${formatOrphanedVectorHint(orphanedVectors, vectorTotal)}`);
   }
 }
 

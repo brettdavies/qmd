@@ -15,6 +15,8 @@ import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, termLink, resolveEmbedModelForCli } from "../src/cli/qmd.ts";
 import { openDatabase } from "../src/db.ts";
+import { createStore, insertContent, insertDocument } from "../src/store.ts";
+import { VEC_ROWS_TABLE, VEC_TABLE } from "../src/vec-layout.ts";
 import { DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI } from "../src/llm.ts";
 import { setConfigSource } from "../src/collections.ts";
 
@@ -1351,6 +1353,39 @@ describe("CLI Cleanup Command", () => {
   });
 });
 
+describe("qmd update stale vector rows", () => {
+  test("a document whose file disappeared loses its vector rows at the end of update", async () => {
+    const env = await createIsolatedTestEnv("stale-vector-rows");
+    const add = await runQmd(["collection", "add", fixturesDir, "--name", "fixtures"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(add.exitCode).toBe(0);
+
+    const store = createStore(env.dbPath);
+    try {
+      const now = new Date().toISOString();
+      insertContent(store.db, "ghosthash", "# Ghost\n\ngone", now);
+      insertDocument(store.db, "fixtures", "ghost.md", "Ghost", "ghosthash", now, now);
+      store.ensureVecTable(3);
+      store.insertEmbedding("ghosthash", 0, 0, new Float32Array([1, 2, 3]), "test", now);
+      expect(store.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE}`).get()).toEqual({ c: 1 });
+    } finally {
+      store.close();
+    }
+
+    const update = await runQmd(["update"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(update.exitCode).toBe(0);
+    expect(update.stdout).toContain("Removed 1 stale vector row(s)");
+
+    const db = openDatabase(env.dbPath);
+    try {
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_ROWS_TABLE}`).get()).toEqual({ c: 0 });
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM content_vectors WHERE hash = 'ghosthash'`).get()).toEqual({ c: 0 });
+      expect(db.prepare(`SELECT active FROM documents WHERE path = 'ghost.md'`).get()).toEqual({ active: 0 });
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe("orphaned embedding vectors (#768)", () => {
   let localDbPath: string;
   let localConfigDir: string;
@@ -1411,11 +1446,13 @@ describe("orphaned embedding vectors (#768)", () => {
     expect(stdout).toContain("qmd cleanup");
   });
 
-  test("update hints when orphan ratio exceeds 10%", async () => {
+  test("update leaves orphaned chunks for cleanup when there is no vector table", async () => {
     const { stdout, exitCode } = await runQmd(["update"], { dbPath: localDbPath, configDir: localConfigDir });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("3 orphaned embedding chunks (75% of vectors)");
-    expect(stdout).toContain("run 'qmd cleanup' to reclaim space");
+    expect(stdout).not.toContain("orphaned embedding chunks");
+    expect(stdout).not.toContain("stale vector row");
+    const status = await runQmd(["status"], { dbPath: localDbPath, configDir: localConfigDir });
+    expect(status.stdout).toMatch(/Orphaned:\s+3 embedding chunks/);
   });
 
   test("cleanup --dry-run reports what would be removed without deleting", async () => {
