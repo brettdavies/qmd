@@ -158,10 +158,40 @@ export function deleteCollectionId(db: Database, name: string): void {
 }
 
 /**
+ * Integer parameter for the vec0 table. better-sqlite3 binds every JS number
+ * as a double, and vec0 checks the bound type of its partition key and rowid
+ * instead of applying column affinity, so those parameters go in as bigint.
+ */
+export function vecInteger(value: number | bigint): bigint {
+  return BigInt(value);
+}
+
+/**
  * One bound parameter for `json_each(?)`: a scoped search over many
  * partitions can return more rowids than SQLite allows as separate
  * parameters (32,766).
  */
 export function rowidList(rowids: readonly number[]): string {
   return JSON.stringify(rowids);
+}
+
+export type MissingPartitionRow = { hash: string; seq: number; collection: string };
+
+/**
+ * Chunks recorded in content_vectors for an active document that have no row
+ * in that document's collection partition. Each one is a vector to copy from
+ * another partition (a hash that gained a collection) or, with no partition
+ * holding it, a chunk to embed again.
+ */
+export function missingPartitionRows(db: Database, collection?: string): MissingPartitionRow[] {
+  const filter = collection ? `AND collection = ?` : ``;
+  return db.prepare(`
+    SELECT cv.hash, cv.seq, d.collection
+    FROM content_vectors cv
+    JOIN (SELECT DISTINCT hash, collection FROM documents WHERE active = 1 ${filter}) d ON d.hash = cv.hash
+    LEFT JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.name = d.collection
+    LEFT JOIN ${VEC_ROWS_TABLE} vr ON vr.hash = cv.hash AND vr.seq = cv.seq AND vr.collection_id = ci.id
+    WHERE vr.id IS NULL
+    ORDER BY cv.hash, cv.seq, d.collection
+  `).all(...(collection ? [collection] : [])) as MissingPartitionRow[];
 }
