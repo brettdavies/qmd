@@ -12,6 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+import { createVectorMetadataTables } from "./vec-layout.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
@@ -1259,6 +1260,7 @@ function initializeDatabase(db: Database): void {
   `);
 
   ensureContentVectorsStatusIndex(db);
+  createVectorMetadataTables(db);
 
   // Document metadata — extraction state plus normalized value rows for
   // metadata filtering. Keyed by document identity, not content hash.
