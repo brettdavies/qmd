@@ -6,6 +6,23 @@
 
 - Added Oxlint lint fence.
 
+### Changed
+
+- The vector index is partitioned by collection. Each embedded chunk is
+  stored once per collection that holds it, under an integer collection id,
+  so a collection-scoped `qmd query` or `qmd vsearch` scans only that
+  collection's vectors instead of pre-filtering the whole index, and a small
+  collection is never crowded out of the results by a large one. The first
+  command after upgrading converts the index in place and prints its
+  progress; the conversion resumes from where it stopped if interrupted, two
+  commands started at once share it, and a VACUUM at the end reclaims the
+  space of the old table. `qmd collection rename` no longer touches vectors,
+  `qmd update` removes the vector rows of changed files as it finishes, and
+  `qmd embed` copies an already-embedded document into a collection that
+  gains it instead of embedding it again. Downgrading to an older qmd
+  afterwards needs `qmd embed -f`, and a `qmd mcp` server started before the
+  upgrade must be restarted.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
