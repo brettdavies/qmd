@@ -57,6 +57,7 @@ import {
   getActiveDocumentPaths,
   cleanupOrphanedContent,
   cleanupOrphanedVectors,
+  copyVectorsToNewCollections,
   countOrphanedVectors,
   previewCleanup,
   runCleanup,
@@ -1017,6 +1018,10 @@ async function updateCollections(): Promise<void> {
   // filter cannot see documents.active, so those rows would take k slots
   // from a scoped search until they are removed.
   const staleVectors = cleanupOrphanedVectors(db);
+  // The pending count below only sees content_vectors, so a hash that joined
+  // a collection while already embedded elsewhere would be neither counted
+  // nor searchable there; copying its rows closes that gap without a model.
+  const copiedVectors = copyVectorsToNewCollections(db).copied;
 
   // Check if any documents need embedding (show once at end)
   const needsEmbedding = getHashesNeedingEmbedding(db);
@@ -1025,6 +1030,9 @@ async function updateCollections(): Promise<void> {
   console.log(`${c.green}✓ All collections updated.${c.reset}`);
   if (staleVectors > 0) {
     console.log(`Removed ${staleVectors} stale vector row(s)`);
+  }
+  if (copiedVectors > 0) {
+    console.log(`Copied ${copiedVectors} vector(s) into collections that gained already-embedded documents`);
   }
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
@@ -2061,6 +2069,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
 
   // Clean up orphaned content hashes (content not referenced by any document)
   const orphanedContent = cleanupOrphanedContent(db);
+  const copiedVectors = copyVectorsToNewCollections(db, collectionName).copied;
 
   // Check if vector index needs updating
   const needsEmbedding = getHashesNeedingEmbedding(db);
@@ -2070,6 +2079,9 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   reportSkippedReads(skippedFiles);
   if (orphanedContent > 0) {
     console.log(`Cleaned up ${orphanedContent} orphaned content hash(es)`);
+  }
+  if (copiedVectors > 0) {
+    console.log(`Copied ${copiedVectors} vector(s) into collections that gained already-embedded documents`);
   }
 
   if (needsEmbedding > 0 && !suppressEmbedNotice) {
