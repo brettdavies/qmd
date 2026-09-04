@@ -22,6 +22,7 @@ import {
   VEC_TABLE,
   createPartitionedVecTable,
   missingPartitionRows,
+  parseDimensions,
   vecLayout,
   vecTableReadable,
   type ReadableVecLayout,
@@ -29,7 +30,6 @@ import {
 
 export const FTS_SYNC_TRIGGERS_VERSION = 1;
 export const VECTOR_PARTITION_VERSION = 2;
-export const STORE_SCHEMA_VERSION = VECTOR_PARTITION_VERSION;
 
 const CURSOR_KEY = "vector_partition_cursor";
 
@@ -193,8 +193,7 @@ function ensurePartitionedTable(db: Database, dimensions: number): void {
     createPartitionedVecTable(db, dimensions);
     return;
   }
-  const match = existing.sql.match(/float\[(\d+)\]/);
-  const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
+  const existingDims = parseDimensions(existing.sql);
   if (existingDims !== dimensions) {
     throw new Error(
       `Vector migration found a ${VEC_TABLE} table with ${existingDims ?? "unknown"} dimensions while the legacy ${layout.kind} table holds ${dimensions}d vectors`
