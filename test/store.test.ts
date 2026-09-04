@@ -17,6 +17,7 @@ import * as llmModule from "../src/llm.js";
 import { disposeDefaultLlamaCpp, setDefaultLlamaCpp } from "../src/llm.js";
 import {
   createStore,
+  DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
   verifySqliteVecLoaded,
@@ -57,6 +58,8 @@ import {
   insertDocument,
   cleanupOrphanedVectors,
   clearAllEmbeddings,
+  copyVectorsToNewCollections,
+  VECTOR_COPY_BATCH_ROWS,
   maybeAdoptLegacyEmbeddingFingerprint,
   removeCollection,
   renameCollection,
@@ -73,7 +76,7 @@ import {
   type RankedListMeta,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
-import { VEC_ROWS_TABLE, VEC_TABLE, deletePartitionRows, resolveCollectionId } from "../src/vec-layout.js";
+import { VEC_ROWS_TABLE, VEC_TABLE, deletePartitionRows, resolveCollectionId, vecInteger } from "../src/vec-layout.js";
 
 // =============================================================================
 // LlamaCpp Setup
@@ -187,6 +190,35 @@ async function insertTestDocument(
   }
 
   return row?.id ?? 0;
+}
+
+/**
+ * Same connection, but any statement whose SQL contains `fragment` throws
+ * `message` instead of running, whether prepared or exec'd.
+ */
+function failingDb(db: Database, fragment: string, message: string): Database {
+  const guard = (sql: string) => {
+    if (sql.includes(fragment)) throw new Error(message);
+  };
+  return {
+    prepare: (sql: string) => {
+      guard(sql);
+      return db.prepare(sql);
+    },
+    transaction: (fn) => db.transaction(fn),
+    exec: (sql: string) => {
+      guard(sql);
+      db.exec(sql);
+    },
+    loadExtension: (path: string) => db.loadExtension(path),
+    close: () => db.close(),
+  };
+}
+
+function vectorRowCount(store: Store, collection: string): number {
+  const id = resolveCollectionId(store.db, collection);
+  if (id === undefined) return 0;
+  return (store.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_ROWS_TABLE} WHERE collection_id = ?`).get(id) as { c: number }).c;
 }
 
 /** Sync YAML config file to SQLite store_collections in the current test store */
@@ -3162,18 +3194,7 @@ describe("cleanupOrphanedVectors atomicity", () => {
   // Fault injection: same connection, but the content_vectors DELETE throws —
   // after the vector DELETEs already executed inside the transaction.
   function makeFailingDb(db: Database): Database {
-    return {
-      prepare: (sql: string) => db.prepare(sql),
-      transaction: (fn) => db.transaction(fn),
-      exec: (sql: string) => {
-        if (sql.includes("DELETE FROM content_vectors")) {
-          throw new Error("injected failure between deletes");
-        }
-        return db.exec(sql);
-      },
-      loadExtension: (path: string) => db.loadExtension(path),
-      close: () => db.close(),
-    };
+    return failingDb(db, "DELETE FROM content_vectors", "injected failure between deletes");
   }
 
   test("removes orphaned chunks from both tables and returns the count", async () => {
@@ -3777,12 +3798,6 @@ describe("Vector Search collection filter", () => {
     }
   }
 
-  function vectorRowCount(store: Store, collection: string): number {
-    const id = resolveCollectionId(store.db, collection);
-    if (id === undefined) return 0;
-    return (store.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_ROWS_TABLE} WHERE collection_id = ?`).get(id) as { c: number }).c;
-  }
-
   test("searchVec scoped to two of three collections returns exactly those two", async () => {
     const store = await createTestStore();
     const first = await createTestCollection({ name: "first", pwd: "/test/first" });
@@ -4119,6 +4134,40 @@ describe("Vector Search collection filter", () => {
     expect((store.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE}`).get() as { c: number }).c).toBe(1);
     const results = await store.searchVec("ignored", "test-model", 5, undefined, undefined, query);
     expect(results.map((r) => r.hash)).toEqual(["kepthash"]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("removeCollection rolls back the partition delete when the documents delete fails", async () => {
+    const store = await createTestStore();
+    const gone = await createTestCollection({ name: "gone", pwd: "/test/gone" });
+    const kept = await createTestCollection({ name: "kept", pwd: "/test/kept" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, gone, "gonehash", [vector(1, 0), vector(0.9, 0.1)]);
+    await insertVecDoc(store, kept, "kepthash", [vector(0.6, 0.8)]);
+    const goneId = resolveCollectionId(store.db, gone)!;
+    const partitionVectors = (id: number) =>
+      (store.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE} WHERE collection_id = ?`).get(vecInteger(id)) as { c: number }).c;
+    const documentsIn = (collection: string) =>
+      (store.db.prepare(`SELECT COUNT(*) AS c FROM documents WHERE collection = ?`).get(collection) as { c: number }).c;
+
+    const failing = failingDb(store.db, "DELETE FROM documents WHERE collection = ?", "injected failure after the partition delete");
+    expect(() => removeCollection(failing, gone)).toThrow("injected failure after the partition delete");
+
+    // The partition delete ran first in the same transaction; none of it survives the rollback.
+    expect(resolveCollectionId(store.db, gone)).toBe(goneId);
+    expect(vectorRowCount(store, gone)).toBe(2);
+    expect(partitionVectors(goneId)).toBe(2);
+    expect(documentsIn(gone)).toBe(1);
+    expect((await store.searchVec("ignored", "test-model", 5, gone, undefined, query)).map((r) => r.hash)).toEqual(["gonehash"]);
+
+    // The connection is left clean: a plain retry removes everything.
+    removeCollection(store.db, gone);
+    expect(resolveCollectionId(store.db, gone)).toBeUndefined();
+    expect(vectorRowCount(store, gone)).toBe(0);
+    expect(partitionVectors(goneId)).toBe(0);
+    expect(documentsIn(gone)).toBe(0);
+    expect(vectorRowCount(store, kept)).toBe(1);
 
     await cleanupTestDb(store);
   });
@@ -4990,6 +5039,142 @@ describe("Embedding batching", () => {
       expect((await store.searchVec("ignored", "test-model", 5, docs, undefined, [1, 2, 3])).map((r) => r.hash)).toEqual(["losthash"]);
     } finally {
       setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  /** Active single-chunk documents for `hashes` in `collection`, in one transaction. */
+  function seedDocs(db: Database, collection: string, hashes: readonly string[]): void {
+    const now = new Date().toISOString();
+    db.transaction(() => {
+      for (const hash of hashes) {
+        insertContent(db, hash, `# ${hash}\n\nBody of ${hash}`, now);
+        insertDocument(db, collection, `${hash}.md`, hash, hash, now, now);
+      }
+    })();
+  }
+
+  /** `chunks` embedded chunks per hash under the default model, in every collection active for the hash, in one transaction. */
+  function seedEmbeddings(store: Store, hashes: readonly string[], chunks = 1): void {
+    const now = new Date().toISOString();
+    store.db.transaction(() => {
+      for (const hash of hashes) {
+        for (let seq = 0; seq < chunks; seq++) {
+          store.insertEmbedding(hash, seq, seq * 100, new Float32Array([1, 2, 3]), DEFAULT_EMBED_MODEL, now, chunks);
+        }
+      }
+    })();
+  }
+
+  function dropPartitionRows(db: Database, hash: string, seq: number): void {
+    const rows = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = ?`).all(hash, seq) as { id: number }[];
+    deletePartitionRows(db, rows.map((row) => row.id));
+  }
+
+  function rowsOfHash(db: Database, table: string, hash: string): number {
+    return (db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE hash = ?`).get(hash) as { c: number }).c;
+  }
+
+  /** Same connection, counting the IMMEDIATE transactions that run through it. */
+  function commitCountingDb(db: Database, commits: { count: number }): Database {
+    return {
+      prepare: (sql: string) => db.prepare(sql),
+      exec: (sql: string) => db.exec(sql),
+      transaction: (fn) => {
+        const wrapped = db.transaction(fn);
+        const immediate = ((...args: Parameters<typeof fn>) => {
+          const result = wrapped.immediate(...args);
+          commits.count++;
+          return result;
+        }) as typeof fn;
+        return Object.assign(((...args: Parameters<typeof fn>) => wrapped(...args)) as typeof fn, { immediate });
+      },
+      loadExtension: (path: string) => db.loadExtension(path),
+      close: () => db.close(),
+    };
+  }
+
+  const paddedHash = (i: number) => `copy${String(i).padStart(4, "0")}`;
+
+  test("generateEmbeddings copies more than one batch of vectors to a collection that gained embedded hashes", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    const fakeLlm = createFakeEmbedLlm();
+
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      const first = await createTestCollection({ name: "first", pwd: "/test/first" });
+      const second = await createTestCollection({ name: "second", pwd: "/test/second" });
+      const hashes = Array.from({ length: VECTOR_COPY_BATCH_ROWS * 2.5 }, (_, i) => paddedHash(i));
+      store.ensureVecTable(3);
+      seedDocs(db, first, hashes);
+      seedEmbeddings(store, hashes);
+      seedDocs(db, second, hashes);
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
+
+      const result = await generateEmbeddings(store);
+
+      expect(fakeLlm.embedBatchCalls).toHaveLength(0);
+      expect(result.chunksCopied).toBe(hashes.length);
+      expect(result.chunksEmbedded).toBe(0);
+      expect(vectorRowCount(store, second)).toBe(hashes.length);
+      const found = await store.searchVec("ignored", "test-model", 5, second, undefined, [1, 2, 3]);
+      expect(found).toHaveLength(5);
+      expect(found.every((r) => r.collectionName === second)).toBe(true);
+      expect(copyVectorsToNewCollections(db)).toEqual({ copied: 0, queued: 0 });
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("copyVectorsToNewCollections queues a hash whose chunks straddle a batch boundary and keeps none of its copies", async () => {
+    const store = await createTestStore();
+    const db = store.db;
+    try {
+      const first = await createTestCollection({ name: "first", pwd: "/test/first" });
+      const second = await createTestCollection({ name: "second", pwd: "/test/second" });
+      store.ensureVecTable(3);
+
+      // missingPartitionRows orders by hash, seq, collection, so single-chunk
+      // hashes place each two-chunk hash's rows on both sides of a batch
+      // boundary. Suffix "a" sorts a hash right after the single it follows.
+      const batch = VECTOR_COPY_BATCH_ROWS;
+      const group1 = Array.from({ length: batch - 1 }, (_, i) => paddedHash(i));
+      // Rows: (seq 0, second) closes batch 1; (seq 1, first) and (seq 1, second) open batch 2.
+      const copiedThenQueued = `${paddedHash(batch - 2)}a`;
+      const group2 = Array.from({ length: batch - 4 }, (_, i) => paddedHash(batch - 1 + i));
+      // Rows: (seq 0, first) and (seq 0, second) close batch 2; (seq 1, second) opens batch 3.
+      const queuedThenSkipped = `${paddedHash(2 * batch - 6)}a`;
+      const singles = [...group1, ...group2];
+      const straddlers = [copiedThenQueued, queuedThenSkipped];
+
+      seedDocs(db, first, [...singles, ...straddlers]);
+      seedEmbeddings(store, singles);
+      seedEmbeddings(store, straddlers, 2);
+      dropPartitionRows(db, copiedThenQueued, 1);
+      dropPartitionRows(db, queuedThenSkipped, 0);
+      seedDocs(db, second, [...singles, ...straddlers]);
+      const missingRows = singles.length + 3 + 3;
+      const commits = { count: 0 };
+
+      const result = copyVectorsToNewCollections(commitCountingDb(db, commits));
+
+      expect(commits.count).toBe(Math.ceil(missingRows / batch));
+      expect(result.queued).toBe(2);
+      // Every single, plus copiedThenQueued's seq 0 written by batch 1 before batch 2 found its seq 1 missing.
+      expect(result.copied).toBe(singles.length + 1);
+      for (const hash of straddlers) {
+        expect(rowsOfHash(db, VEC_ROWS_TABLE, hash)).toBe(0);
+        expect(rowsOfHash(db, "content_vectors", hash)).toBe(0);
+      }
+      expect(vectorRowCount(store, first)).toBe(singles.length);
+      expect(vectorRowCount(store, second)).toBe(singles.length);
+      expect(store.getHashesNeedingEmbedding()).toBe(2);
+      expect(copyVectorsToNewCollections(db)).toEqual({ copied: 0, queued: 0 });
+    } finally {
       await cleanupTestDb(store);
     }
   });

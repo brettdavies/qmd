@@ -36,6 +36,7 @@ import {
   vecInteger,
   vecLayout,
   vecTableReadable,
+  type MissingPartitionRow,
 } from "./vec-layout.js";
 import {
   FTS_SYNC_TRIGGERS_VERSION,
@@ -3669,28 +3670,30 @@ function deleteVectorPartition(db: Database, collectionName: string): void {
 }
 
 /**
- * Remove a collection and clean up its documents.
- * Uses collections.ts to remove from YAML config and cleans up database.
+ * Remove a collection: its vector partition, its documents, the content no
+ * active document references any more, and its store_collections row.
  */
 export function removeCollection(db: Database, collectionName: string): { deletedDocs: number; cleanedHashes: number } {
-  deleteVectorPartition(db, collectionName);
+  // One commit: a partition delete that lands without the documents delete
+  // leaves the mapping and id row out of step with the vec0 table, and the
+  // update-time orphan cleanup skips rows whose documents are still active.
+  return db.transaction(() => {
+    deleteVectorPartition(db, collectionName);
 
-  // Delete documents from database
-  const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
+    const docResult = db.prepare(`DELETE FROM documents WHERE collection = ?`).run(collectionName);
 
-  // Clean up orphaned content hashes
-  const cleanupResult = db.prepare(`
-    DELETE FROM content
-    WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
-  `).run();
+    const cleanupResult = db.prepare(`
+      DELETE FROM content
+      WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)
+    `).run();
 
-  // Remove from store_collections
-  deleteStoreCollection(db, collectionName);
+    deleteStoreCollection(db, collectionName);
 
-  return {
-    deletedDocs: docResult.changes,
-    cleanedHashes: cleanupResult.changes
-  };
+    return {
+      deletedDocs: docResult.changes,
+      cleanedHashes: cleanupResult.changes,
+    };
+  }).immediate();
 }
 
 /**
@@ -4405,39 +4408,57 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
   }).immediate());
 }
 
+/** Partition rows written per commit by copyVectorsToNewCollections. */
+export const VECTOR_COPY_BATCH_ROWS = 1000;
+
 /**
  * Give every active (hash, collection) pair whose chunks are embedded a row
  * in that collection's partition, copied from any partition that holds the
  * chunk, so a hash that gains a collection is searchable there without
  * another model call. A chunk no partition holds is queued for embedding by
  * deleting its hash's rows, which the pending detector then picks up.
+ *
+ * Rows commit in batches of VECTOR_COPY_BATCH_ROWS so a collection that gains
+ * thousands of embedded hashes does not hold the write lock for the whole
+ * copy; an interrupted run resumes from whatever missingPartitionRows still
+ * reports.
  */
 export function copyVectorsToNewCollections(db: Database, collection?: string): { copied: number; queued: number } {
   const layout = vecLayout(db);
   if (layout.kind === "legacy" || !isSqliteVecAvailable()) return { copied: 0, queued: 0 };
-  return withLazyContentVectorMigration(db, () => db.transaction(() => {
+  return withLazyContentVectorMigration(db, () => {
     const missing = missingPartitionRows(db, collection);
     if (missing.length === 0) return { copied: 0, queued: 0 };
     const writer = layout.kind === "partitioned" ? new PartitionWriter(db) : null;
     const storedVector = writer ? storedEmbeddingLookup(db) : null;
+    const deleteChunks = db.prepare(`DELETE FROM content_vectors WHERE hash = ?`);
     const queued = new Set<string>();
     let copied = 0;
-    for (const row of missing) {
-      if (queued.has(row.hash)) continue;
-      const vector = storedVector?.(row.hash, row.seq);
-      if (!vector || !writer) {
-        queued.add(row.hash);
-        continue;
+    const copyBatch = (rows: MissingPartitionRow[]) => {
+      const queuedNow: string[] = [];
+      for (const row of rows) {
+        if (queued.has(row.hash)) continue;
+        const vector = storedVector?.(row.hash, row.seq);
+        if (!vector || !writer) {
+          queued.add(row.hash);
+          queuedNow.push(row.hash);
+          continue;
+        }
+        if (writer.writeToCollection(row.hash, row.seq, row.collection, vector)) copied++;
       }
-      if (writer.writeToCollection(row.hash, row.seq, row.collection, vector)) copied++;
-    }
-    const deleteChunks = db.prepare(`DELETE FROM content_vectors WHERE hash = ?`);
-    for (const hash of queued) {
-      deletePartitionRowsOfHash(db, hash);
-      deleteChunks.run(hash);
+      // Deleting by hash also removes rows an earlier batch already committed
+      // for it; the run-level set keeps a later batch from copying it again.
+      for (const hash of queuedNow) {
+        deletePartitionRowsOfHash(db, hash);
+        deleteChunks.run(hash);
+      }
+    };
+    for (let start = 0; start < missing.length; start += VECTOR_COPY_BATCH_ROWS) {
+      const batch = missing.slice(start, start + VECTOR_COPY_BATCH_ROWS);
+      db.transaction(() => copyBatch(batch)).immediate();
     }
     return { copied, queued: queued.size };
-  }).immediate());
+  });
 }
 
 /**
