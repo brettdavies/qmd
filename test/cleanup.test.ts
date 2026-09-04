@@ -18,10 +18,12 @@ import {
   previewCleanup,
   repackVectors,
   runCleanup,
+  searchVec,
   vectorTableLayout,
   type Store,
 } from "../src/store.js";
 import type { Database } from "../src/db.js";
+import { VEC_ROWS_TABLE, VEC_TABLE, deletePartitionRows, partitionRowKey, resolveCollectionId, vecInteger } from "../src/vec-layout.js";
 
 let store: Store | null = null;
 
@@ -114,25 +116,26 @@ describe("qmd cleanup reclaim (#550)", () => {
 describe("qmd cleanup vector repack", () => {
   const DIMS = 3;
 
+  const hashOf = (prefix: string, i: number) => `${prefix}${String(i).padStart(5, "0")}`;
+
   /**
-   * Inserts `total` vectors, then deletes every one except the indexes in
-   * `keep` (which also get active documents). vec0 drops a chunk only when it
+   * Inserts `total` embedded documents into `collection`, then deletes every
+   * vector row except the indexes in `keep`. vec0 drops a chunk only when it
    * is completely empty, so keeping one row in each chunk leaves the holes.
    */
-  async function seedVectors(s: Store, total: number, keep: readonly number[]): Promise<void> {
+  async function seedVectors(s: Store, total: number, keep: readonly number[], collection = "docs", prefix = "vec"): Promise<void> {
     const now = new Date().toISOString();
     s.ensureVecTable(DIMS);
     s.db.transaction(() => {
       for (let i = 0; i < total; i++) {
-        const hash = `vec${String(i).padStart(5, "0")}`;
-        if (keep.includes(i)) {
-          insertContent(s.db, hash, `body ${hash}`, now);
-          insertDocument(s.db, "docs", `${hash}.md`, hash, hash, now, now);
-        }
+        const hash = hashOf(prefix, i);
+        insertContent(s.db, hash, `body ${hash}`, now);
+        insertDocument(s.db, collection, `${hash}.md`, hash, hash, now, now);
         s.insertEmbedding(hash, 0, 0, new Float32Array([1, i * 0.001, 0]), "test-model", now, 1);
       }
-      const drop = s.db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
-      for (let i = 0; i < total; i++) if (!keep.includes(i)) drop.run(`vec${String(i).padStart(5, "0")}_0`);
+      const kept = new Set(keep.map((i) => hashOf(prefix, i)));
+      const rows = s.db.prepare(`SELECT vr.id, vr.hash FROM ${VEC_ROWS_TABLE} vr JOIN vector_collection_ids ci ON ci.id = vr.collection_id WHERE ci.name = ?`).all(collection) as { id: number; hash: string }[];
+      deletePartitionRows(s.db, rows.filter((row) => !kept.has(row.hash)).map((row) => row.id));
     })();
   }
 
@@ -140,8 +143,17 @@ describe("qmd cleanup vector repack", () => {
   const HOLEY = { total: 1100, keep: [0, 1, 1099] } as const;
 
   function nearest(s: Store): string {
-    const row = s.db.prepare(`SELECT hash_seq FROM vectors_vec WHERE embedding MATCH ? AND k = 1`).get(new Float32Array([1, 0, 0])) as { hash_seq: string };
-    return row.hash_seq;
+    const row = s.db.prepare(`SELECT rowid FROM ${VEC_TABLE} WHERE embedding MATCH ? AND k = 1`).get(new Float32Array([1, 0, 0])) as { rowid: number };
+    return partitionRowKey(s.db, row.rowid)!.hash;
+  }
+
+  /** Hashes whose vector rows are present in the vec0 table, in hash order. */
+  function liveHashes(s: Store): string[] {
+    return (s.db.prepare(`SELECT hash FROM ${VEC_ROWS_TABLE} WHERE id IN (SELECT rowid FROM ${VEC_TABLE}) ORDER BY hash`).all() as { hash: string }[]).map((row) => row.hash);
+  }
+
+  function partitionCount(s: Store, collection: string): number {
+    return (s.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE} WHERE collection_id = ?`).get(vecInteger(resolveCollectionId(s.db, collection)!)) as { c: number }).c;
   }
 
   test("layout counts the chunks a packed table would need against the chunks in use", async () => {
@@ -165,10 +177,8 @@ describe("qmd cleanup vector repack", () => {
     expect(stats.vectorsRepacked).toBe(true);
     expect(stats.vectorLayout).toMatchObject({ chunks: 2, neededChunks: 1 });
     expect(vectorTableLayout(s.db)).toEqual({ rows: 3, chunks: 1, neededChunks: 1, occupancy: 1 });
-    expect(s.db.prepare(`SELECT hash_seq FROM vectors_vec ORDER BY hash_seq`).all()).toEqual([
-      { hash_seq: "vec00000_0" }, { hash_seq: "vec00001_0" }, { hash_seq: "vec01099_0" },
-    ]);
-    expect(nearest(s)).toBe("vec00000_0");
+    expect(liveHashes(s)).toEqual(["vec00000", "vec00001", "vec01099"]);
+    expect(nearest(s)).toBe("vec00000");
   });
 
   test("runCleanup leaves a packed table alone", async () => {
@@ -194,7 +204,7 @@ describe("qmd cleanup vector repack", () => {
     const failing: Database = {
       prepare: (sql: string) => {
         const real = s.db.prepare(sql);
-        if (!sql.startsWith("INSERT INTO vectors_vec (")) return real;
+        if (!sql.startsWith(`INSERT INTO ${VEC_TABLE} (`)) return real;
         return { ...real, get: real.get.bind(real), all: real.all.bind(real), iterate: real.iterate.bind(real), run: () => { throw new Error("injected failure during re-insert"); } };
       },
       transaction: (fn) => s.db.transaction(fn),
@@ -205,10 +215,8 @@ describe("qmd cleanup vector repack", () => {
 
     expect(() => repackVectors(failing)).toThrow("injected failure during re-insert");
     expect(vectorTableLayout(s.db)).toEqual({ rows: 3, chunks: 2, neededChunks: 1, occupancy: 0.5 });
-    expect(nearest(s)).toBe("vec00000_0");
-    expect(s.db.prepare(`SELECT hash_seq FROM vectors_vec ORDER BY hash_seq`).all()).toEqual([
-      { hash_seq: "vec00000_0" }, { hash_seq: "vec00001_0" }, { hash_seq: "vec01099_0" },
-    ]);
+    expect(nearest(s)).toBe("vec00000");
+    expect(liveHashes(s)).toEqual(["vec00000", "vec00001", "vec01099"]);
   });
 
   test("previewCleanup projects the layout after orphan removal, matching what runCleanup does", async () => {
@@ -233,16 +241,21 @@ describe("qmd cleanup vector repack", () => {
     expect(vectorTableLayout(s.db)).toEqual({ rows: 1024, chunks: 1, neededChunks: 1, occupancy: 1 });
   });
 
-  test("a legacy vector table without hash_seq is left alone", async () => {
+  test("repack moves rows within their own partition and leaves each partition's newest chunk alone", async () => {
     const s = await openStore();
-    s.ensureVecTable(DIMS);
-    s.db.exec(`DROP TABLE vectors_vec`);
-    s.db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash TEXT PRIMARY KEY, embedding float[${DIMS}] distance_metric=cosine)`);
-    s.db.transaction(() => {
-      for (let i = 0; i < 1100; i++) s.db.prepare(`INSERT INTO vectors_vec (hash, embedding) VALUES (?, ?)`).run(`legacy${i}`, new Float32Array([1, i * 0.001, 0]));
-      for (let i = 2; i < 1099; i++) s.db.prepare(`DELETE FROM vectors_vec WHERE hash = ?`).run(`legacy${i}`);
-    })();
+    await seedVectors(s, HOLEY.total, HOLEY.keep, "alpha", "alpha");
+    await seedVectors(s, HOLEY.total, HOLEY.keep, "beta", "beta");
+    expect(vectorTableLayout(s.db)).toEqual({ rows: 6, chunks: 4, neededChunks: 1, occupancy: 0.25 });
 
-    expect(repackVectors(s.db)).toEqual({ rows: 3, chunks: 2, neededChunks: 1, occupancy: 0.5 });
+    const stats = runCleanup(s.db);
+
+    expect(stats.vectorsRepacked).toBe(true);
+    expect(vectorTableLayout(s.db)).toEqual({ rows: 6, chunks: 2, neededChunks: 1, occupancy: 0.5 });
+    expect(partitionCount(s, "alpha")).toBe(3);
+    expect(partitionCount(s, "beta")).toBe(3);
+    const alpha = await searchVec(s.db, "ignored", "test-model", 5, "alpha", undefined, [1, 0, 0]);
+    expect(alpha.map((r) => r.hash).sort()).toEqual(["alpha00000", "alpha00001", "alpha01099"]);
+    const beta = await searchVec(s.db, "ignored", "test-model", 5, "beta", undefined, [1, 0, 0]);
+    expect(beta.map((r) => r.hash).sort()).toEqual(["beta00000", "beta00001", "beta01099"]);
   });
 });
