@@ -120,7 +120,7 @@ export function createVectorMetadataTables(db: Database): void {
 
 export function createPartitionedVecTable(db: Database, dimensions: number): void {
   db.exec(
-    `CREATE VIRTUAL TABLE ${VEC_TABLE} USING vec0(collection_id INTEGER PARTITION KEY, embedding float[${dimensions}] distance_metric=cosine)`
+    `CREATE VIRTUAL TABLE IF NOT EXISTS ${VEC_TABLE} USING vec0(collection_id INTEGER PARTITION KEY, embedding float[${dimensions}] distance_metric=cosine)`
   );
 }
 
