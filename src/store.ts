@@ -33,6 +33,7 @@ import {
   vecInteger,
   vecLayout,
   vecTableReadable,
+  type VecLayout,
 } from "./vec-layout.js";
 import {
   FTS_SYNC_TRIGGERS_VERSION,
@@ -2869,29 +2870,28 @@ export type VectorTableLayout = {
 interface VecChunkRow {
   chunkId: number;
   size: number;
+  partition: number;
   validity: Uint8Array;
   rowids: Uint8Array;
 }
 
-function vecTableReadable(db: Database): boolean {
-  if (!isSqliteVecAvailable()) return false;
-  try {
-    db.prepare(`SELECT 1 FROM vectors_vec LIMIT 0`).get();
-    return true;
-  } catch {
-    return false;
-  }
+/** The partitioned vec0 table when sqlite-vec is loaded and the table answers; null otherwise. */
+function readableVectorLayout(db: Database): Extract<VecLayout, { kind: "partitioned" }> | null {
+  if (!isSqliteVecAvailable()) return null;
+  const layout = vecLayout(db);
+  return layout.kind === "partitioned" && vecTableReadable(db, layout) ? layout : null;
 }
 
 /**
- * Chunk layout of vectors_vec from vec0's shadow tables, or null without a
- * readable table. `droppedRows` projects the layout after that many rows are
+ * Chunk layout of the vector table from vec0's shadow tables, or null without
+ * a readable table. `droppedRows` projects the layout after that many rows are
  * deleted without their chunks going away, which is what orphan removal does.
  */
 export function vectorTableLayout(db: Database, droppedRows: number = 0): VectorTableLayout | null {
-  if (!vecTableReadable(db)) return null;
-  const chunkRow = db.prepare(`SELECT COUNT(*) AS chunks, MAX(size) AS chunkSize FROM vectors_vec_chunks`).get() as { chunks: number; chunkSize: number | null };
-  const stored = (db.prepare(`SELECT COUNT(*) AS c FROM vectors_vec_rowids`).get() as { c: number }).c;
+  const layout = readableVectorLayout(db);
+  if (!layout) return null;
+  const chunkRow = db.prepare(`SELECT COUNT(*) AS chunks, MAX(size) AS chunkSize FROM ${layout.shadow.chunks}`).get() as { chunks: number; chunkSize: number | null };
+  const stored = (db.prepare(`SELECT COUNT(*) AS c FROM ${layout.shadow.rowids}`).get() as { c: number }).c;
   const rows = Math.max(stored - droppedRows, 0);
   const chunkSize = chunkRow.chunkSize ?? 0;
   const neededChunks = chunkSize > 0 ? Math.ceil(rows / chunkSize) : 0;
@@ -2899,15 +2899,15 @@ export function vectorTableLayout(db: Database, droppedRows: number = 0): Vector
   return { rows, chunks: chunkRow.chunks, neededChunks, occupancy };
 }
 
-/** Rows of vectors_vec that cleanupOrphanedVectors would delete: orphaned chunks that still hold a vector. */
+/** Vector rows cleanupOrphanedVectors would delete: partition rows whose (hash, collection) has no active document. */
 function countOrphanedVectorRows(db: Database): number {
-  if (!vecTableReadable(db)) return 0;
-  return withLazyContentVectorMigration(db, () => (db.prepare(`
+  if (!readableVectorLayout(db)) return 0;
+  return (db.prepare(`
     SELECT COUNT(*) AS c
-    FROM content_vectors cv
-    WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1)
-      AND EXISTS (SELECT 1 FROM vectors_vec_rowids r WHERE r.id = cv.hash || '_' || cv.seq)
-  `).get() as { c: number }).c);
+    FROM ${VEC_ROWS_TABLE} vr
+    JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
+    WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = vr.hash AND d.collection = ci.name AND d.active = 1)
+  `).get() as { c: number }).c;
 }
 
 function liveSlots(chunk: VecChunkRow): number[] {
@@ -2919,36 +2919,35 @@ function liveSlots(chunk: VecChunkRow): number[] {
 }
 
 /**
- * Compact vectors_vec in place: the live rows of every chunk that is mostly
- * holes are deleted and re-inserted, one chunk per IMMEDIATE transaction.
- * vec0 puts each insert in the first free slot of its newest chunk and drops
- * a chunk once it is empty, so the moved rows fill the tail and the emptied
- * chunks vanish. A transaction holds the write lock for at most one chunk of
+ * Compact the vector table in place: the live rows of every chunk that is
+ * mostly holes are deleted and re-inserted under their rowid and partition,
+ * one chunk per IMMEDIATE transaction. vec0 puts each insert in the first
+ * free slot of its partition's newest chunk and drops a chunk once it is
+ * empty, so the moved rows fill that partition's tail and the emptied chunks
+ * vanish; each partition's newest chunk is left alone because that is where
+ * its rows land. A transaction holds the write lock for at most one chunk of
  * rows, so concurrent embed and update runs interleave with it, and an
  * interrupted run leaves a consistent table that the next cleanup finishes.
- * A legacy table without a hash_seq key is left for ensureVecTable to rebuild.
  */
 export function repackVectors(db: Database, onChunk?: (moved: number, total: number) => void): VectorTableLayout | null {
-  if (!vecTableReadable(db)) return null;
-  const ddl = (db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vectors_vec'`).get() as { sql: string }).sql;
-  if (!ddl.includes("hash_seq")) return vectorTableLayout(db);
-  const chunks = db.prepare(`SELECT chunk_id AS chunkId, size, validity, rowids FROM vectors_vec_chunks ORDER BY chunk_id`).all() as VecChunkRow[];
-  const newest = chunks.length > 0 ? chunks[chunks.length - 1]!.chunkId : -1;
-  const sparse = chunks.filter((c) => c.chunkId !== newest && liveSlots(c).length < c.size * VEC_REPACK_CHUNK_FILL);
-  const keyOf = db.prepare(`SELECT id FROM vectors_vec_rowids WHERE rowid = ?`);
-  const vectorOf = db.prepare(`SELECT embedding FROM vectors_vec WHERE hash_seq = ?`);
-  const remove = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`);
-  const insert = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  const layout = readableVectorLayout(db);
+  if (!layout) return null;
+  const chunks = db.prepare(`SELECT chunk_id AS chunkId, size, partition00 AS partition, validity, rowids FROM ${layout.shadow.chunks} ORDER BY chunk_id`).all() as VecChunkRow[];
+  const newestByPartition = new Map<number, number>();
+  for (const chunk of chunks) newestByPartition.set(chunk.partition, chunk.chunkId);
+  const sparse = chunks.filter((c) => newestByPartition.get(c.partition) !== c.chunkId && liveSlots(c).length < c.size * VEC_REPACK_CHUNK_FILL);
+  const vectorOf = db.prepare(`SELECT embedding FROM ${layout.table} WHERE rowid = ?`);
+  const remove = db.prepare(`DELETE FROM ${layout.table} WHERE rowid = ?`);
+  const insert = db.prepare(`INSERT INTO ${layout.table} (rowid, collection_id, embedding) VALUES (?, ?, ?)`);
   sparse.forEach((chunk, i) => {
     const rowids = new DataView(chunk.rowids.buffer, chunk.rowids.byteOffset, chunk.rowids.byteLength);
     db.transaction(() => {
       for (const slot of liveSlots(chunk)) {
-        const key = (keyOf.get(rowids.getBigInt64(slot * 8, true)) as { id: string } | undefined)?.id;
-        if (key === undefined) continue;
-        const row = vectorOf.get(key) as { embedding: Uint8Array } | undefined;
+        const rowid = rowids.getBigInt64(slot * 8, true);
+        const row = vectorOf.get(rowid) as { embedding: Uint8Array } | undefined;
         if (row === undefined) continue;
-        remove.run(key);
-        insert.run(key, row.embedding);
+        remove.run(rowid);
+        insert.run(rowid, vecInteger(chunk.partition), row.embedding);
       }
     }).immediate();
     onChunk?.(i + 1, sparse.length);
@@ -2983,7 +2982,7 @@ export type CleanupStats = {
   orphanedVectors: number;
   inactiveDocs: number;
   orphanedContent: number;
-  /** Chunk layout of vectors_vec before any repack, null without a vector table. */
+  /** Chunk layout of the vector table before any repack, null without a vector table. */
   vectorLayout: VectorTableLayout | null;
   /** True when the vector table was repacked (or, in a preview, would be). */
   vectorsRepacked: boolean;
