@@ -17,11 +17,13 @@ import {
   VEC_COLLECTION_IDS_TABLE,
   VEC_ROWS_TABLE,
   VEC_TABLE,
+  activeCollectionsOfHash,
   allocateCollectionId,
   createPartitionedVecTable,
   createVectorMetadataTables,
   deleteCollectionId,
   deletePartitionRows,
+  deletePartitionRowsOfHash,
   hasVectorIndex,
   missingPartitionRows,
   partitionRowKey,
@@ -29,6 +31,7 @@ import {
   resolveCollectionId,
   resolveCollectionIds,
   rowidList,
+  storedEmbeddingLookup,
   upsertPartitionVector,
   vecInteger,
   vecLayout,
@@ -4515,7 +4518,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
   `;
   const collectionId = resolveCollectionId(db, collection);
 
-  withLazyContentVectorMigration(db, () => {
+  withLazyContentVectorMigration(db, () => db.transaction(() => {
     if (collectionId !== undefined) {
       const rows = db.prepare(`
         SELECT id FROM ${VEC_ROWS_TABLE}
@@ -4536,7 +4539,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
       db.exec(`DELETE FROM ${VEC_ROWS_TABLE}`);
       db.exec(`DROP TABLE IF EXISTS ${VEC_TABLE}`);
     }
-  });
+  }).immediate());
 }
 
 /**
@@ -4553,24 +4556,21 @@ export function copyVectorsToNewCollections(db: Database, collection?: string): 
     const missing = missingPartitionRows(db, collection);
     if (missing.length === 0) return { copied: 0, queued: 0 };
     const writer = layout.kind === "partitioned" ? new PartitionWriter(db) : null;
-    const sourceOf = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = ? LIMIT 1`);
-    const vectorOf = writer ? db.prepare(`SELECT embedding FROM ${VEC_TABLE} WHERE rowid = ?`) : null;
+    const storedVector = writer ? storedEmbeddingLookup(db) : null;
     const queued = new Set<string>();
     let copied = 0;
     for (const row of missing) {
       if (queued.has(row.hash)) continue;
-      const source = sourceOf.get(row.hash, row.seq) as { id: number } | undefined;
-      const vector = source && vectorOf ? (vectorOf.get(vecInteger(source.id)) as { embedding: Uint8Array } | undefined) : undefined;
+      const vector = storedVector?.(row.hash, row.seq);
       if (!vector || !writer) {
         queued.add(row.hash);
         continue;
       }
-      if (writer.writeToCollection(row.hash, row.seq, row.collection, vector.embedding)) copied++;
+      if (writer.writeToCollection(row.hash, row.seq, row.collection, vector)) copied++;
     }
-    const partitionRowsOf = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ?`);
     const deleteChunks = db.prepare(`DELETE FROM content_vectors WHERE hash = ?`);
     for (const hash of queued) {
-      deletePartitionRows(db, (partitionRowsOf.all(hash) as { id: number }[]).map((row) => row.id));
+      deletePartitionRowsOfHash(db, hash);
       deleteChunks.run(hash);
     }
     return { copied, queued: queued.size };
@@ -4598,8 +4598,7 @@ export function insertEmbedding(
     db.transaction(() => {
       db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
         .run(hash, seq, pos, model, fingerprint, totalChunks, embeddedAt);
-      const collections = db.prepare(`SELECT DISTINCT collection FROM documents WHERE hash = ? AND active = 1`).all(hash) as { collection: string }[];
-      for (const { collection } of collections) {
+      for (const collection of activeCollectionsOfHash(db, hash)) {
         upsertPartitionVector(db, hash, seq, allocateCollectionId(db, collection), embedding);
       }
     })();
@@ -4611,13 +4610,12 @@ function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<stri
     let removed = 0;
     const rowsStmt = db.prepare(`SELECT seq FROM content_vectors WHERE hash = ? AND model = ?`);
     const deleteContentStmt = db.prepare(`DELETE FROM content_vectors WHERE hash = ? AND model = ?`);
-    const partitionRowsStmt = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ?`);
 
     for (const [hash, expectedChunks] of expectedChunksByHash) {
       const rows = rowsStmt.all(hash, model) as { seq: number }[];
       if (rows.length === 0 || rows.length === expectedChunks) continue;
 
-      deletePartitionRows(db, (partitionRowsStmt.all(hash) as { id: number }[]).map((row) => row.id));
+      deletePartitionRowsOfHash(db, hash);
       deleteContentStmt.run(hash, model);
       removed += rows.length;
     }
