@@ -13,12 +13,15 @@ import {
   VECTOR_PARTITION_VERSION,
   getUserVersion,
   migrateVectorLayout,
+  runStoreMigrations,
+  type VectorMigrationPhase,
   type VectorMigrationProgress,
 } from "../src/store-migrations.js";
 import {
   LEGACY_VEC_TABLE,
   VEC_ROWS_TABLE,
   VEC_TABLE,
+  createPartitionedVecTable,
   resolveCollectionId,
   vecInteger,
   vecLayout,
@@ -312,6 +315,91 @@ describe("migrateVectorLayout", () => {
     expect(partitionCount(s.db, "b")).toBe(STANDARD_B_ROWS + 1);
   });
 
+  test("a legacy row written after the copy phase and before the flip ends up in the partition", async () => {
+    const s = await openStore();
+    const fixture = seedStandardFixture(s.db);
+    const phases: VectorMigrationPhase[] = [];
+    let injected = false;
+
+    expect(migrateVectorLayout(s.db, {
+      sqliteVecAvailable: true,
+      onProgress: (p) => {
+        phases.push(p.phase);
+        if (p.phase === "verify" && !injected) {
+          injected = true;
+          fixture.embedded("b", "late", [vec(0.7, 0.7, 0.1)]);
+        }
+      },
+    })).toBe("applied");
+
+    expect(injected).toBe(true);
+    expect(phases.slice(phases.indexOf("verify"))).toEqual(["verify", "flip", "vacuum", "done"]);
+    expect(storedVector(s.db, "late", 0, "b")).toEqual(Array.from(vec(0.7, 0.7, 0.1)));
+    expect(partitionCount(s.db, "b")).toBe(STANDARD_B_ROWS + 1);
+    expect(s.db.prepare(`SELECT 1 FROM content_vectors WHERE hash = 'late' AND seq = 0`).get()).toBeTruthy();
+    expect(tableNames(s.db, LEGACY_VEC_TABLE)).toEqual([]);
+  });
+
+  test("the verification pass and the drop hold one write lock", async () => {
+    const s = await openStore();
+    seedStandardFixture(s.db);
+    const other = openSecondConnection(s);
+    other.exec(`PRAGMA busy_timeout = 0`);
+    let lockedAtFlip: boolean | null = null;
+
+    expect(migrateVectorLayout(s.db, {
+      sqliteVecAvailable: true,
+      onProgress: (p) => {
+        if (p.phase !== "flip") return;
+        try {
+          other.exec(`BEGIN IMMEDIATE`);
+          other.exec(`ROLLBACK`);
+          lockedAtFlip = false;
+        } catch {
+          lockedAtFlip = true;
+        }
+      },
+    })).toBe("applied");
+
+    expect(lockedAtFlip).toBe(true);
+    expect(vecLayout(s.db).kind).toBe("partitioned");
+    expect(tableNames(s.db, LEGACY_VEC_TABLE)).toEqual([]);
+  });
+
+  test("creating the partitioned table a second time is a no-op", async () => {
+    const s = await openStore();
+    createPartitionedVecTable(s.db, DIMS);
+    expect(() => createPartitionedVecTable(s.db, DIMS)).not.toThrow();
+    expect(vecLayout(s.db)).toMatchObject({ kind: "partitioned", dimensions: DIMS });
+    expect(tableNames(s.db, VEC_TABLE)).toContain(`${VEC_TABLE}_chunks`);
+  });
+
+  test("a second opener finishes the migration with the partitioned table another opener created", async () => {
+    const s = await openStore();
+    seedStandardFixture(s.db);
+    createPartitionedVecTable(s.db, DIMS);
+    expect(vecLayout(s.db).kind).toBe("legacy");
+    const second = openSecondConnection(s);
+
+    expect(migrateVectorLayout(second, { sqliteVecAvailable: true })).toBe("applied");
+
+    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(vecLayout(s.db)).toMatchObject({ kind: "partitioned", dimensions: DIMS });
+    expect(partitionCount(s.db, "a")).toBe(STANDARD_A_ROWS);
+    expect(partitionCount(s.db, "b")).toBe(STANDARD_B_ROWS);
+    expect(migrateVectorLayout(s.db, { sqliteVecAvailable: true })).toBe("applied");
+  });
+
+  test("refuses a partitioned table whose dimensions differ from the legacy table's", async () => {
+    const s = await openStore();
+    seedStandardFixture(s.db);
+    createPartitionedVecTable(s.db, DIMS + 1);
+
+    expect(() => migrateVectorLayout(s.db, { sqliteVecAvailable: true })).toThrow(/dimensions/);
+    expect(getUserVersion(s.db)).toBe(1);
+    expect(vecLayout(s.db).kind).toBe("legacy");
+  });
+
   test("the flip drops the legacy table and its shadow tables with the version stamp", async () => {
     const s = await openStore();
     seedStandardFixture(s.db);
@@ -324,5 +412,33 @@ describe("migrateVectorLayout", () => {
     expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
     expect(migrateVectorLayout(s.db, { sqliteVecAvailable: true })).toBe("applied");
     expect(partitionCount(s.db, "a")).toBe(STANDARD_A_ROWS);
+  });
+});
+
+describe("runStoreMigrations", () => {
+  test("migrates a legacy table an older build created on a stamped store", async () => {
+    const s = await openStore();
+    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    seedStandardFixture(s.db);
+    s.db.exec(`PRAGMA user_version = ${VECTOR_PARTITION_VERSION}`);
+    expect(vecLayout(s.db).kind).toBe("legacy");
+
+    runStoreMigrations(s.db, { installFtsSyncTriggers: () => {}, sqliteVecAvailable: true });
+
+    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(vecLayout(s.db)).toMatchObject({ kind: "partitioned", dimensions: DIMS });
+    expect(tableNames(s.db, LEGACY_VEC_TABLE)).toEqual([]);
+    expect(partitionCount(s.db, "a")).toBe(STANDARD_A_ROWS);
+    expect(partitionCount(s.db, "b")).toBe(STANDARD_B_ROWS);
+  });
+
+  test("leaves a stamped store without a legacy table alone", async () => {
+    const s = await openStore();
+    createPartitionedVecTable(s.db, DIMS);
+
+    runStoreMigrations(s.db, { installFtsSyncTriggers: () => { throw new Error("must not reinstall"); }, sqliteVecAvailable: true });
+
+    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(vecLayout(s.db)).toMatchObject({ kind: "partitioned", dimensions: DIMS });
   });
 });
