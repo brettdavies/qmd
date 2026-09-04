@@ -45,7 +45,7 @@ function shadowTables(table: string): VecShadowTables {
   };
 }
 
-function parseDimensions(sql: string | null): number | null {
+export function parseDimensions(sql: string | null): number | null {
   const match = sql?.match(/float\[(\d+)\]/);
   return match?.[1] ? parseInt(match[1], 10) : null;
 }
@@ -186,6 +186,19 @@ export function deletePartitionRows(db: Database, rowids: readonly number[]): vo
   }
 }
 
+/** Deletes every partition row of a hash, in every collection. */
+export function deletePartitionRowsOfHash(db: Database, hash: string): void {
+  const rows = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ?`).all(hash) as { id: number }[];
+  deletePartitionRows(db, rows.map((row) => row.id));
+}
+
+const ACTIVE_COLLECTIONS_OF_HASH_SQL = `SELECT DISTINCT collection FROM documents WHERE hash = ? AND active = 1`;
+
+/** Names of the collections with an active document for the hash: the partitions that must hold its vectors. */
+export function activeCollectionsOfHash(db: Database, hash: string): string[] {
+  return (db.prepare(ACTIVE_COLLECTIONS_OF_HASH_SQL).all(hash) as { collection: string }[]).map((row) => row.collection);
+}
+
 /**
  * Replace or insert the vector of (hash, seq) in one collection's partition.
  * vec0 ignores OR REPLACE, so an existing row is deleted and its rowid reused.
@@ -211,7 +224,7 @@ export class PartitionWriter {
   private readonly insertVec;
 
   constructor(private readonly db: Database) {
-    this.collectionsOf = db.prepare(`SELECT DISTINCT collection FROM documents WHERE hash = ? AND active = 1`);
+    this.collectionsOf = db.prepare(ACTIVE_COLLECTIONS_OF_HASH_SQL);
     this.insertRow = db.prepare(`INSERT OR IGNORE INTO ${VEC_ROWS_TABLE} (hash, seq, collection_id) VALUES (?, ?, ?)`);
     this.insertVec = db.prepare(`INSERT INTO ${VEC_TABLE} (rowid, collection_id, embedding) VALUES (?, ?, ?)`);
   }
@@ -243,12 +256,24 @@ export class PartitionWriter {
   }
 }
 
+/**
+ * Lookup of stored vector bytes by (hash, seq) from whichever partition holds
+ * the chunk, with its two statements prepared once for callers that loop.
+ */
+export function storedEmbeddingLookup(db: Database): (hash: string, seq: number) => Uint8Array | undefined {
+  const rowOf = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = ? LIMIT 1`);
+  const vectorOf = db.prepare(`SELECT embedding FROM ${VEC_TABLE} WHERE rowid = ?`);
+  return (hash, seq) => {
+    const row = rowOf.get(hash, seq) as { id: number } | undefined;
+    if (!row) return undefined;
+    const stored = vectorOf.get(vecInteger(row.id)) as { embedding: Uint8Array } | undefined;
+    return stored?.embedding;
+  };
+}
+
 /** Stored vector bytes of (hash, seq) from whichever partition holds it. */
 export function storedEmbedding(db: Database, hash: string, seq: number): Uint8Array | undefined {
-  const row = db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ? AND seq = ? LIMIT 1`).get(hash, seq) as { id: number } | undefined;
-  if (!row) return undefined;
-  const stored = db.prepare(`SELECT embedding FROM ${VEC_TABLE} WHERE rowid = ?`).get(vecInteger(row.id)) as { embedding: Uint8Array } | undefined;
-  return stored?.embedding;
+  return storedEmbeddingLookup(db)(hash, seq);
 }
 
 /** (hash, seq) behind a vec0 rowid. */
