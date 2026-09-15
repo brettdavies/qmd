@@ -4,6 +4,14 @@ on:
   push:
     tags: ["v*"]
 
+# The group key leads with a literal token naming the workflow that owns it, so
+# it cannot collide with a key a caller or callee produces from context alone.
+# This group never cancels: a run killed part way leaves a half-finished
+# release or deploy.
+concurrency:
+  group: publish-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest

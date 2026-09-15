@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+# The group key leads with a literal token naming the workflow that owns it. A
+# key built only from context (`${{ github.workflow }}`) is one a called
+# reusable also produces, because `github.workflow` resolves to the caller
+# inside a called workflow; both land in one group and the reusable's queue
+# cancels the run that called it.
+concurrency:
+  group: nix-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-flake:
     name: Build flake (${{ matrix.os }})
