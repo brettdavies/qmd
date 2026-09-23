@@ -13,8 +13,8 @@ afterEach(() => { store.close(); });
 
 function addDocument(hash: string, path: string, active: boolean = true): void {
   store.insertContent(hash, `Body for ${hash}`, "2026-01-01");
-  const id = store.insertDocument("test", path, hash, hash, "2026-01-01", "2026-01-01");
-  if (!active) store.db.prepare("UPDATE documents SET active = 0 WHERE id = ?").run(id);
+  store.insertDocument("test", path, hash, hash, "2026-01-01", "2026-01-01");
+  if (!active) store.deactivateDocument("test", path);
 }
 
 function addChunk(hash: string, seq: number, model: string = "model", fingerprint: string = "current"): void {
