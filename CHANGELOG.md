@@ -6,6 +6,8 @@
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
+- Vector diagnostics match passages by their saved character position, avoiding
+  false mismatches when earlier chunks change the sequence numbering.
 
 ### Added
 

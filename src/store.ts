@@ -2546,6 +2546,7 @@ export type IndexStatus = {
 export type EmbeddingVectorSample = {
   hash: string;
   seq: number;
+  pos: number;
   body: string;
   path: string;
 };
@@ -2555,7 +2556,7 @@ export function getEmbeddingVectorSamples(db: Database, model: string, fingerpri
   // and duplicate path can make a three-row sample sort gigabytes of text.
   return db.prepare(`
     WITH sampled AS MATERIALIZED (
-      SELECT cv.hash, cv.seq
+      SELECT cv.hash, cv.seq, cv.pos
       FROM content_vectors cv
       JOIN content c ON c.hash = cv.hash
       WHERE cv.model = ? AND cv.embed_fingerprint = ?
@@ -2565,7 +2566,7 @@ export function getEmbeddingVectorSamples(db: Database, model: string, fingerpri
       ORDER BY random()
       LIMIT ?
     )
-    SELECT sampled.hash, sampled.seq, c.doc AS body,
+    SELECT sampled.hash, sampled.seq, sampled.pos, c.doc AS body,
       (SELECT MIN(d.path) FROM documents d
        WHERE d.hash = sampled.hash AND d.active = 1) AS path
     FROM sampled
