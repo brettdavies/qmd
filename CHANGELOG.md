@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `qmd doctor` selects vector sample identities before loading document bodies,
+  avoiding excessive SQLite memory use on large indexes with duplicate paths.
+
 ### Added
 
 - Added Oxlint lint fence.

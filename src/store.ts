@@ -2543,6 +2543,36 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
+export type EmbeddingVectorSample = {
+  hash: string;
+  seq: number;
+  body: string;
+  path: string;
+};
+
+export function getEmbeddingVectorSamples(db: Database, model: string, fingerprint: string, sampleSize: number = 3): EmbeddingVectorSample[] {
+  // Limit chunk identities before reading bodies. Joining bodies to every chunk
+  // and duplicate path can make a three-row sample sort gigabytes of text.
+  return db.prepare(`
+    WITH sampled AS MATERIALIZED (
+      SELECT cv.hash, cv.seq
+      FROM content_vectors cv
+      JOIN content c ON c.hash = cv.hash
+      WHERE cv.model = ? AND cv.embed_fingerprint = ?
+        AND EXISTS (
+          SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+        )
+      ORDER BY random()
+      LIMIT ?
+    )
+    SELECT sampled.hash, sampled.seq, c.doc AS body,
+      (SELECT MIN(d.path) FROM documents d
+       WHERE d.hash = sampled.hash AND d.active = 1) AS path
+    FROM sampled
+    JOIN content c ON c.hash = sampled.hash
+  `).all<EmbeddingVectorSample>(model, fingerprint, sampleSize);
+}
+
 export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
   const fingerprint = getEmbeddingFingerprint(model);
