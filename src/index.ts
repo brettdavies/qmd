@@ -572,9 +572,11 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       // A changed file rewrites its document's hash in place and strands the
       // old hash's partition rows, which take k slots from scoped searches;
       // a hash that joined a collection while embedded elsewhere stays
-      // unsearchable there until its rows are copied.
-      const staleVectorsRemoved = cleanupOrphanedVectors(db);
+      // unsearchable there until its rows are copied. The copy runs first:
+      // the cleanup deletes the partition rows it copies from, so a document
+      // moved between collections would otherwise need a fresh embed.
       const vectorsCopied = copyVectorsToNewCollections(db).copied;
+      const staleVectorsRemoved = cleanupOrphanedVectors(db);
 
       return {
         collections: filtered.length,
