@@ -3,7 +3,7 @@
  * per-collection partitioned layout, chunk by chunk, resumably, and drops the
  * legacy table in the transaction that stamps the version.
  */
-import { describe, test, expect, afterEach } from "vitest";
+import { describe, test, expect, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -430,6 +430,23 @@ describe("runStoreMigrations", () => {
     expect(tableNames(s.db, LEGACY_VEC_TABLE)).toEqual([]);
     expect(partitionCount(s.db, "a")).toBe(STANDARD_A_ROWS);
     expect(partitionCount(s.db, "b")).toBe(STANDARD_B_ROWS);
+  });
+
+  test("keeps the legacy table in place when the repair fails on a stamped store", async () => {
+    const s = await openStore();
+    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    seedStandardFixture(s.db);
+    s.db.exec(`PRAGMA user_version = ${VECTOR_PARTITION_VERSION}`);
+    createPartitionedVecTable(s.db, DIMS + 1);
+    expect(vecLayout(s.db).kind).toBe("legacy");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(() => runStoreMigrations(s.db, { installFtsSyncTriggers: () => {}, sqliteVecAvailable: true })).not.toThrow();
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("Legacy vector table left in place"));
+    expect(getUserVersion(s.db)).toBe(VECTOR_PARTITION_VERSION);
+    expect(vecLayout(s.db).kind).toBe("legacy");
+    warn.mockRestore();
   });
 
   test("leaves a stamped store without a legacy table alone", async () => {
