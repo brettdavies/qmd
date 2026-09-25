@@ -91,6 +91,7 @@ import {
 import { syncDocumentMetadata, countDocumentsPendingMetadata } from "../metadata-store.js";
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, type MetadataFilter } from "../metadata-filter.js";
+import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
@@ -2204,7 +2205,7 @@ async function vectorIndex(
   const storeInstance = getStore();
   const db = storeInstance.db;
 
-  // Exclusive process lock — concurrent embeds race on vectors_vec (#825)
+  // Exclusive process lock — concurrent embeds race on vector_rows (#825)
   const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
   if (!embedLock) {
     console.log(EMBED_LOCK_BUSY_MESSAGE);
@@ -4014,8 +4015,7 @@ export async function checkEmbeddingVectorSamples(db: Database, model: string, f
     return { ok: true, details: "no active documents indexed" };
   }
 
-  const vecTableExists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
-  if (!vecTableExists) {
+  if (!hasVectorIndex(db)) {
     return { ok: false, details: "no vector table to test; please run qmd embed again" };
   }
 
@@ -4047,13 +4047,13 @@ export async function checkEmbeddingVectorSamples(db: Database, model: string, f
         continue;
       }
 
-      const stored = db.prepare(`SELECT embedding FROM vectors_vec WHERE hash_seq = ?`).get(hashSeq) as { embedding: Uint8Array } | undefined;
+      const stored = storedEmbedding(db, sample.hash, sample.seq);
       if (!stored) {
         mismatches.push(`${shortHashSeq(hashSeq)}: stored vector missing`);
         continue;
       }
 
-      const distance = cosineDistance(result.embedding, decodeStoredEmbedding(stored.embedding));
+      const distance = cosineDistance(result.embedding, decodeStoredEmbedding(stored));
       if (distance > threshold) {
         mismatches.push(`${shortHashSeq(hashSeq)}: stored vector distance ${distance.toFixed(6)}`);
       }
