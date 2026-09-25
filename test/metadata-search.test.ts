@@ -235,6 +235,38 @@ describe("searchVec with metadata filter", () => {
     expect(filtered.map(r => r.displayPath)).toEqual(["docs/b.md"]);
   });
 
+  const eligibleOnly: MetadataFilter = { key: "eligible", operator: "eq", value: true };
+
+  /** An eligible document and an ineligible copy of its content in one collection, one chunk per vector. */
+  async function insertLongDocumentWithExcludedCopy(vectors: number[][]): Promise<void> {
+    const body = "# Many chunks";
+    const { hash } = await insertDoc("book", "many-chunks.md", body, { eligible: true });
+    await insertDoc("book", "excluded-copy.md", body, { eligible: false });
+    const now = new Date().toISOString();
+    vectors.forEach((vector, seq) => insertEmbedding(store.db, hash, seq, seq * 100, new Float32Array(vector), model, now, vectors.length));
+  }
+
+  test("a document with many close chunks does not starve another eligible document", async () => {
+    store.ensureVecTable(3);
+    await insertLongDocumentWithExcludedCopy(Array.from({ length: 20 }, () => [1, 0, 0]));
+    await insertEmbeddedDoc("book", "second-document.md", "# Second document", [0, 1, 0], { eligible: true });
+
+    const results = await searchVec(store.db, "q", model, 2, undefined, undefined, queryEmbedding, undefined, eligibleOnly);
+    expect(results.map(r => r.displayPath)).toEqual(["book/many-chunks.md", "book/second-document.md"]);
+  });
+
+  test.each([20, 450])("the best chunk of a %i-chunk document survives deduplication", async (chunks) => {
+    store.ensureVecTable(3);
+    await insertLongDocumentWithExcludedCopy(
+      Array.from({ length: chunks }, (_, seq) => (seq === chunks - 1 ? [1, 0, 0] : [0, 0, 1])),
+    );
+    await insertEmbeddedDoc("book", "second-document.md", "# Second document", [-1, 0.1, 0], { eligible: true });
+
+    const results = await searchVec(store.db, "q", model, 2, undefined, undefined, queryEmbedding, undefined, eligibleOnly);
+    expect(results.map(r => r.displayPath)).toEqual(["book/many-chunks.md", "book/second-document.md"]);
+    expect(results[0]!.chunkPos).toBe((chunks - 1) * 100);
+  });
+
   test("a filter admitting more than 20,000 chunks still returns its nearest eligible documents", async () => {
     store.ensureVecTable(3);
     store.db.exec("BEGIN");
@@ -256,20 +288,10 @@ describe("searchVec with metadata filter", () => {
 
   test("shared content hash within one collection returns only the matching document path", async () => {
     store.ensureVecTable(3);
-    const now = new Date().toISOString();
     const body = "# Shared body";
-    const hash = await hashContent(body);
-    insertContent(store.db, hash, body, now);
-
-    const publishedId = insertDocument(store.db, "notes", "published-copy.md", "t", hash, now, now);
-    const draftId = insertDocument(store.db, "notes", "draft-copy.md", "t", hash, now, now);
-    replaceDocumentMetadata(store.db, publishedId, {
-      metadata: { status: "published" }, extractionVersion: METADATA_EXTRACTION_VERSION,
-    });
-    replaceDocumentMetadata(store.db, draftId, {
-      metadata: { status: "draft" }, extractionVersion: METADATA_EXTRACTION_VERSION,
-    });
-    insertEmbedding(store.db, hash, 0, 0, new Float32Array([1, 0, 0]), model, now, 1);
+    const { hash } = await insertDoc("notes", "published-copy.md", body, { status: "published" });
+    await insertDoc("notes", "draft-copy.md", body, { status: "draft" });
+    insertEmbedding(store.db, hash, 0, 0, new Float32Array([1, 0, 0]), model, new Date().toISOString(), 1);
 
     const filtered = await searchVec(
       store.db, "q", model, 10, "notes", undefined, queryEmbedding, undefined,
