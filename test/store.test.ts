@@ -3991,6 +3991,23 @@ describe("Vector Search collection filter", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchVec fills its limit when one document's chunks take every candidate slot", async () => {
+    const store = await createTestStore();
+    const book = await createTestCollection({ name: "book", pwd: "/test/book" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, book, "manychunks", Array.from({ length: 20 }, () => vector(1, 0)));
+    await insertVecDoc(store, book, "seconddoc", [vector(0.2, 1)]);
+
+    for (const scope of [book, undefined]) {
+      for (const limit of [2, 5]) {
+        const results = await store.searchVec("ignored", "test-model", limit, scope, undefined, query);
+        expect(results.map((r) => r.hash)).toEqual(["manychunks", "seconddoc"]);
+      }
+    }
+
+    await cleanupTestDb(store);
+  });
+
   test("searchVec rows carry the vec source, a cosine score, and the best chunk position", async () => {
     const store = await createTestStore();
     const embedded = await createTestCollection({ name: "embedded", pwd: "/test/embedded" });
@@ -5369,10 +5386,10 @@ describe("Embedding batching", () => {
       expect(db.prepare(`SELECT COUNT(*) AS c FROM documents WHERE active = 1`).get()).toEqual({ c: 2 });
       expect(db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE}`).get()).toEqual({ c: 6 });
 
-      // Four stale rows sit nearer the query than both live documents: with
-      // limit 1 every one of the scoped KNN's three slots goes to a row no
-      // active document owns, and the search comes back empty.
-      expect(await store.searchVec("ignored", "test-model", 1, "docs", undefined, near)).toEqual([]);
+      // Four stale rows sit nearer the query than both live documents and take
+      // every one of the first scoped KNN's three slots at limit 1; the search
+      // only answers after widening its KNN past them.
+      expect(await store.searchVec("ignored", "test-model", 1, "docs", undefined, near)).toHaveLength(1);
 
       expect(cleanupOrphanedVectors(db)).toBe(4);
 

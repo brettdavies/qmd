@@ -27,9 +27,12 @@
   space of the old table. `qmd collection rename` no longer touches vectors,
   `qmd update` removes the vector rows of changed files as it finishes, and
   `qmd embed` copies an already-embedded document into a collection that
-  gains it instead of embedding it again. Downgrading to an older qmd
-  afterwards needs `qmd embed -f`, and a `qmd mcp` server started before the
-  upgrade must be restarted.
+  gains it instead of embedding it again. A metadata-filtered vector search
+  returns the nearest documents the filter admits however many chunks it
+  admits, and a vector search fills its limit even when one long document
+  holds all of the nearest chunks. Downgrading to an older qmd afterwards
+  needs `qmd embed -f`, and a `qmd mcp` server started before the upgrade
+  must be restarted.
 
 ## [2.8.3] - 2026-08-16
 

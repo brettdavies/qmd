@@ -4248,14 +4248,38 @@ interface VecScanTarget {
   eligibleRowids?: readonly number[];
 }
 
+/** The document behind a vector match, at its nearest chunk. */
+interface VecDocumentMatch {
+  rowid: number;
+  hash: string;
+  pos: number;
+  filepath: string;
+  display_path: string;
+  title: string;
+  metadata_json: string | null;
+  distance: number;
+}
+
+/**
+ * A metadata filter as SQL over a `document_metadata dm` join, admitting only
+ * documents whose metadata extraction is current and error-free.
+ */
+function compileCurrentMetadataFilter(filter: MetadataFilter): { sql: string; params: SQLiteValue[] } {
+  const compiled = compileMetadataFilter(filter, "d");
+  return {
+    sql: `dm.extraction_version = ${METADATA_EXTRACTION_VERSION} AND dm.extraction_error IS NULL AND ${compiled.sql}`,
+    params: compiled.params,
+  };
+}
+
 /**
  * Prepares an exact top-k cosine scan of the vector table, run once per
- * target. vec0 evaluates the partition equality inside the scan, so a small
- * collection costs its own rows rather than the whole index and is never
- * crowded out by a larger one (#775, #791, #803). A `rowid IN` restriction is
- * applied inside the scan the same way, so a selective metadata filter gets an
- * exact top-k of its own rows instead of whatever survives a post-filter of a
- * larger top-k.
+ * target with k in 1..SQLITE_VEC_MAX_K. vec0 evaluates the partition equality
+ * inside the scan, so a small collection costs its own rows rather than the
+ * whole index and is never crowded out by a larger one (#775, #791, #803). A
+ * `rowid IN` restriction is applied inside the scan the same way, so a
+ * selective metadata filter gets an exact top-k of its own rows instead of
+ * whatever survives a post-filter of a larger top-k.
  */
 function knnVecScanner(db: Database, partitioned: boolean, restricted: boolean): (embedding: Float32Array, k: number, target: VecScanTarget) => VecMatch[] {
   const conditions = ["embedding MATCH ?", "k = ?"];
@@ -4267,7 +4291,7 @@ function knnVecScanner(db: Database, partitioned: boolean, restricted: boolean):
     WHERE ${conditions.join(" AND ")}
   `);
   return (embedding, k, target) => {
-    const params: SQLiteValue[] = [embedding, Math.max(1, Math.min(SQLITE_VEC_MAX_K, k))];
+    const params: SQLiteValue[] = [embedding, k];
     if (partitioned) params.push(vecInteger(target.collectionId ?? 0));
     if (restricted) params.push(rowidList(target.eligibleRowids ?? []));
     return statement.all(...params) as VecMatch[];
@@ -4280,8 +4304,8 @@ function knnVecScanner(db: Database, partitioned: boolean, restricted: boolean):
  * holds the row's content passes the filter.
  */
 function metadataEligibleVectorRows(db: Database, filter: MetadataFilter, collectionIds?: readonly number[]): Map<number, number[]> {
-  const compiled = compileMetadataFilter(filter, "d");
-  const params: SQLiteValue[] = [...compiled.params];
+  const current = compileCurrentMetadataFilter(filter);
+  const params: SQLiteValue[] = [...current.params];
   let scope = "";
   if (collectionIds) {
     scope = ` AND vr.collection_id IN (SELECT value FROM json_each(?))`;
@@ -4293,10 +4317,7 @@ function metadataEligibleVectorRows(db: Database, filter: MetadataFilter, collec
     JOIN document_metadata dm ON dm.document_id = d.id
     JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.name = d.collection
     JOIN ${VEC_ROWS_TABLE} vr ON vr.hash = d.hash AND vr.collection_id = ci.id
-    WHERE d.active = 1
-      AND dm.extraction_version = ${METADATA_EXTRACTION_VERSION}
-      AND dm.extraction_error IS NULL
-      AND ${compiled.sql}${scope}
+    WHERE d.active = 1 AND ${current.sql}${scope}
   `).all(...params) as { rowid: number; collectionId: number }[];
   const byCollection = new Map<number, number[]>();
   for (const row of rows) {
@@ -4305,6 +4326,71 @@ function metadataEligibleVectorRows(db: Database, filter: MetadataFilter, collec
     else byCollection.set(row.collectionId, [row.rowid]);
   }
   return byCollection;
+}
+
+/**
+ * Prepares step 2 of a vector search: the documents behind a set of vector
+ * rows, one per file at its nearest chunk, nearest first. The rowids are bound
+ * as one JSON parameter, so the statement text stays fixed and a match set up
+ * to the 4096 k cap never meets SQLite's bound-parameter limit. Bodies are
+ * left out: one long document can hold every match, and only the final results
+ * load theirs.
+ */
+function vecDocumentResolver(db: Database, filter?: MetadataFilter): (matches: readonly VecMatch[]) => VecDocumentMatch[] {
+  // Re-apply the filter on the document join: vectors are content-scoped,
+  // so one hash can belong to both matching and non-matching documents.
+  const current = filter ? compileCurrentMetadataFilter(filter) : undefined;
+  const statement = withLazyContentVectorMigration(db, () => db.prepare(`
+    SELECT
+      vr.id AS rowid,
+      cv.hash,
+      cv.pos,
+      'qmd://' || d.collection || '/' || d.path as filepath,
+      d.collection || '/' || d.path as display_path,
+      d.title,
+      dm.metadata_json
+    FROM json_each(?) j
+    JOIN ${VEC_ROWS_TABLE} vr ON vr.id = j.value
+    JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
+    JOIN content_vectors cv ON cv.hash = vr.hash AND cv.seq = vr.seq
+    JOIN documents d ON d.hash = vr.hash AND d.collection = ci.name
+    JOIN content ON content.hash = d.hash
+    LEFT JOIN document_metadata dm ON dm.document_id = d.id
+    WHERE d.active = 1${current ? ` AND ${current.sql}` : ""}
+  `));
+  return (matches) => {
+    if (matches.length === 0) return [];
+    const distanceByRowid = new Map(matches.map(r => [r.rowid, r.distance]));
+    const rows = statement.all(rowidList(matches.map(r => r.rowid)), ...(current?.params ?? [])) as Omit<VecDocumentMatch, "distance">[];
+    const best = new Map<string, VecDocumentMatch>();
+    for (const row of rows) {
+      const distance = distanceByRowid.get(row.rowid) ?? 1;
+      const existing = best.get(row.filepath);
+      if (!existing || distance < existing.distance) best.set(row.filepath, { ...row, distance });
+    }
+    return Array.from(best.values()).sort((a, b) => a.distance - b.distance);
+  };
+}
+
+/**
+ * Nearest documents of one scan target. The first KNN asks for three chunks
+ * per requested document. Chunks of one long document can still fill every
+ * slot, so while the matches collapse into fewer than `limit` documents and
+ * the target holds rows beyond them, k doubles, up to sqlite-vec's cap.
+ */
+function nearestVecDocuments(
+  scan: ReturnType<typeof knnVecScanner>,
+  resolve: ReturnType<typeof vecDocumentResolver>,
+  queryVec: Float32Array,
+  limit: number,
+  target: VecScanTarget,
+): VecDocumentMatch[] {
+  for (let k = limit * 3; ; k *= 2) {
+    const vecK = Math.max(1, Math.min(SQLITE_VEC_MAX_K, k));
+    const matches = scan(queryVec, vecK, target);
+    const documents = resolve(matches);
+    if (documents.length >= limit || matches.length < vecK || vecK === SQLITE_VEC_MAX_K) return documents;
+  }
 }
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
@@ -4326,72 +4412,29 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // "optimize" this by combining into a single query with JOINs - it will break.
   // See: https://github.com/tobi/qmd/pull/23
 
-  // Step 1: Get vector matches from sqlite-vec (no JOINs allowed): one KNN per
-  // collection in scope, three candidate chunks per requested result, so
-  // multi-chunk documents can still yield `limit` unique files. One statement
-  // per member rather than `collection_id IN (...)`: the IN form yields k rows
-  // per value only because SQLite runs vec0's filter once per value, which is
-  // a planner detail rather than a vec0 contract.
+  // Step 1 gets vector matches from sqlite-vec (no JOINs allowed), one KNN per
+  // collection in scope; step 2 resolves them to documents. One statement per
+  // member rather than `collection_id IN (...)`: the IN form yields k rows per
+  // value only because SQLite runs vec0's filter once per value, which is a
+  // planner detail rather than a vec0 contract.
   const targets: VecScanTarget[] = collectionIds
     ? collectionIds.map(collectionId => ({ collectionId, eligibleRowids: eligible?.get(collectionId) }))
     : [{ eligibleRowids: eligible && Array.from(eligible.values()).flat() }];
   const scanTargets = eligible ? targets.filter(t => t.eligibleRowids?.length) : targets;
   if (scanTargets.length === 0) return [];
   const scan = knnVecScanner(db, collectionIds !== undefined, eligible !== undefined);
+  const resolve = vecDocumentResolver(db, filter);
   const queryVec = new Float32Array(embedding);
-  const vecResults = scanTargets.flatMap(target => scan(queryVec, limit * 3, target));
-  if (vecResults.length === 0) return [];
+  const bodyOf = db.prepare(`SELECT doc FROM content WHERE hash = ?`);
 
-  // Step 2: Get chunk info and document data by rowid. The rowids are bound
-  // as one JSON parameter: thirteen partitions at the k cap exceed SQLite's
-  // limit on separate bound parameters.
-  const docParams: SQLiteValue[] = [rowidList(vecResults.map(r => r.rowid))];
-  let docFilter = "";
-  if (filter) {
-    // Re-apply the filter on the document join: vectors are content-scoped,
-    // so one hash can belong to both matching and non-matching documents.
-    const compiled = compileMetadataFilter(filter, "d");
-    docFilter = ` AND dm.extraction_version = ${METADATA_EXTRACTION_VERSION} AND dm.extraction_error IS NULL AND ${compiled.sql}`;
-    docParams.push(...compiled.params);
-  }
-  const distanceByRowid = new Map(vecResults.map(r => [r.rowid, r.distance]));
-  const docRows = withLazyContentVectorMigration(db, () => db.prepare(`
-    SELECT
-      vr.id AS rowid,
-      cv.hash,
-      cv.pos,
-      'qmd://' || d.collection || '/' || d.path as filepath,
-      d.collection || '/' || d.path as display_path,
-      d.title,
-      content.doc as body,
-      dm.metadata_json
-    FROM json_each(?) j
-    JOIN ${VEC_ROWS_TABLE} vr ON vr.id = j.value
-    JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
-    JOIN content_vectors cv ON cv.hash = vr.hash AND cv.seq = vr.seq
-    JOIN documents d ON d.hash = vr.hash AND d.collection = ci.name
-    JOIN content ON content.hash = d.hash
-    LEFT JOIN document_metadata dm ON dm.document_id = d.id
-    WHERE d.active = 1${docFilter}
-  `).all(...docParams) as {
-    rowid: number; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string; metadata_json: string | null;
-  }[]);
-
-  // Combine with distances and dedupe by filepath
-  const seen = new Map<string, { row: typeof docRows[0]; bestDist: number }>();
-  for (const row of docRows) {
-    const distance = distanceByRowid.get(row.rowid) ?? 1;
-    const existing = seen.get(row.filepath);
-    if (!existing || distance < existing.bestDist) {
-      seen.set(row.filepath, { row, bestDist: distance });
-    }
-  }
-
-  return Array.from(seen.values())
-    .sort((a, b) => a.bestDist - b.bestDist)
+  // Each target yields its own nearest `limit` documents (or all it holds), so
+  // merging them by distance gives the scope's exact nearest `limit`.
+  return scanTargets
+    .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target))
+    .sort((a, b) => a.distance - b.distance)
     .slice(0, limit)
-    .map(({ row, bestDist }) => {
+    .map((row) => {
+      const body = (bodyOf.get(row.hash) as { doc: string }).doc;
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
       return {
         filepath: row.filepath,
@@ -4401,11 +4444,11 @@ export async function searchVec(db: Database, query: string, model: string, limi
         docid: getDocid(row.hash),
         collectionName,
         modifiedAt: "",  // Not available in vec query
-        bodyLength: row.body.length,
-        body: row.body,
+        bodyLength: body.length,
+        body,
         context: getContextForFile(db, row.filepath),
         metadata: parseMetadataJson(row.metadata_json),
-        score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
+        score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
       };
