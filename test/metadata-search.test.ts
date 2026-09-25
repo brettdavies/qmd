@@ -234,6 +234,49 @@ describe("searchVec with metadata filter", () => {
     );
     expect(filtered.map(r => r.displayPath)).toEqual(["docs/b.md"]);
   });
+
+  test("a filter admitting more than 20,000 chunks still returns its nearest eligible documents", async () => {
+    store.ensureVecTable(3);
+    store.db.exec("BEGIN");
+    for (let i = 0; i < 20_001; i++) {
+      await insertEmbeddedDoc("book", `eligible-${i}.md`, `# Eligible ${i}`, [0, 1, 0], { eligible: true });
+    }
+    for (let i = 0; i < 200; i++) {
+      await insertEmbeddedDoc("book", `closer-${i}.md`, `# Closer ${i}`, [1, 0, 0], { eligible: false });
+    }
+    store.db.exec("COMMIT");
+
+    const filtered = await searchVec(
+      store.db, "q", model, 5, "book", undefined, queryEmbedding, undefined,
+      { key: "eligible", operator: "eq", value: true },
+    );
+    expect(filtered).toHaveLength(5);
+    expect(filtered.every(r => r.metadata.eligible === true)).toBe(true);
+  }, 120_000);
+
+  test("shared content hash within one collection returns only the matching document path", async () => {
+    store.ensureVecTable(3);
+    const now = new Date().toISOString();
+    const body = "# Shared body";
+    const hash = await hashContent(body);
+    insertContent(store.db, hash, body, now);
+
+    const publishedId = insertDocument(store.db, "notes", "published-copy.md", "t", hash, now, now);
+    const draftId = insertDocument(store.db, "notes", "draft-copy.md", "t", hash, now, now);
+    replaceDocumentMetadata(store.db, publishedId, {
+      metadata: { status: "published" }, extractionVersion: METADATA_EXTRACTION_VERSION,
+    });
+    replaceDocumentMetadata(store.db, draftId, {
+      metadata: { status: "draft" }, extractionVersion: METADATA_EXTRACTION_VERSION,
+    });
+    insertEmbedding(store.db, hash, 0, 0, new Float32Array([1, 0, 0]), model, now, 1);
+
+    const filtered = await searchVec(
+      store.db, "q", model, 10, "notes", undefined, queryEmbedding, undefined,
+      { key: "status", operator: "eq", value: "published" },
+    );
+    expect(filtered.map(r => r.displayPath)).toEqual(["notes/published-copy.md"]);
+  });
 });
 
 describe("structuredSearch with metadata filter", () => {
