@@ -8,7 +8,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
-import type { Database } from "../src/db.js";
+import type { Database, SQLiteValue } from "../src/db.js";
 import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -68,6 +68,7 @@ import {
   _resetProductionModeForTesting,
   hybridQuery,
   structuredSearch,
+  searchVec,
   vectorSearchQuery,
   type Store,
   type DocumentResult,
@@ -76,7 +77,7 @@ import {
   type RankedListMeta,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
-import { VEC_ROWS_TABLE, VEC_TABLE, deletePartitionRows, resolveCollectionId, vecInteger } from "../src/vec-layout.js";
+import { LEGACY_VEC_TABLE, VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE, VEC_TABLE, deletePartitionRows, resolveCollectionId, vecInteger } from "../src/vec-layout.js";
 
 // =============================================================================
 // LlamaCpp Setup
@@ -3480,6 +3481,31 @@ describe("Vector Table", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("ensureVecTable keeps a dimensionless vector table and its row map when clearing the rows fails", async () => {
+    const store = await createTestStore();
+    try {
+      // No float[N] in the declaration, so ensureVecTable drops and recreates it.
+      const dimensionless = `CREATE TABLE ${VEC_TABLE} (collection_id INTEGER, embedding BLOB)`;
+      store.db.exec(dimensionless);
+      store.db.prepare(`INSERT INTO ${VEC_ROWS_TABLE} (hash, seq, collection_id) VALUES ('h1', 0, 1)`).run();
+      store.db.exec(`CREATE TRIGGER block_vector_rows_delete BEFORE DELETE ON ${VEC_ROWS_TABLE} BEGIN SELECT RAISE(ABORT, 'injected failure clearing vector rows'); END`);
+      const vecTableSql = () => (store.db.prepare(`SELECT sql FROM sqlite_master WHERE name = ?`).get(VEC_TABLE) as { sql: string } | null | undefined)?.sql;
+      const rowCount = () => (store.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_ROWS_TABLE}`).get() as { c: number }).c;
+
+      expect(() => store.ensureVecTable(8)).toThrow("injected failure clearing vector rows");
+
+      expect(vecTableSql()).toBe(dimensionless);
+      expect(rowCount()).toBe(1);
+
+      store.db.exec(`DROP TRIGGER block_vector_rows_delete`);
+      store.ensureVecTable(8);
+      expect(vecTableSql()).toContain("float[8]");
+      expect(rowCount()).toBe(0);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 // =============================================================================
@@ -4136,6 +4162,148 @@ describe("Vector Search collection filter", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchVec drops a result whose content row vanishes after its document resolved", async () => {
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "racing", pwd: "/test/racing" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, collection, "nearhash", [vector(1, 0)]);
+    await insertVecDoc(store, collection, "vanishhash", [vector(0.9, 0.44)]);
+    await insertVecDoc(store, collection, "farhash", [vector(0.8, 0.6)]);
+
+    // Replays another process's orphaned-content cleanup landing between
+    // document resolution and the body read.
+    const bodySql = "SELECT doc FROM content WHERE hash = ?";
+    const racing: Database = {
+      prepare: (sql: string) => {
+        const statement = store.db.prepare(sql);
+        if (!sql.includes(bodySql)) return statement;
+        return {
+          run: (...params: SQLiteValue[]) => statement.run(...params),
+          all: <T,>(...params: SQLiteValue[]) => statement.all<T>(...params),
+          iterate: <T,>(...params: SQLiteValue[]) => statement.iterate<T>(...params),
+          get: <T,>(...params: SQLiteValue[]) => {
+            if (params[0] === "vanishhash") store.db.prepare(`DELETE FROM content WHERE hash = ?`).run("vanishhash");
+            return statement.get<T>(...params);
+          },
+        };
+      },
+      transaction: (fn) => store.db.transaction(fn),
+      exec: (sql: string) => store.db.exec(sql),
+      loadExtension: (path: string) => store.db.loadExtension(path),
+      close: () => store.db.close(),
+    };
+
+    const results = await searchVec(racing, "ignored", "test-model", 3, undefined, undefined, query);
+
+    expect(results.map((r) => r.hash)).toEqual(["nearhash", "farhash"]);
+    expect(results.map((r) => r.body)).toEqual(["Document nearhash", "Document farhash"]);
+
+    await cleanupTestDb(store);
+  });
+
+  function documentsIn(store: Store, collection: string): number {
+    return (store.db.prepare(`SELECT COUNT(*) AS c FROM documents WHERE collection = ?`).get(collection) as { c: number }).c;
+  }
+
+  function storeCollectionNames(store: Store, ...names: string[]): string[] {
+    return (store.db.prepare(`SELECT name FROM store_collections WHERE name IN (${names.map(() => "?").join(", ")}) ORDER BY name`)
+      .all(...names) as { name: string }[]).map((row) => row.name);
+  }
+
+  test("renameCollection onto a removed collection's leftover partition drops the leftover and keeps the renamed vectors", async () => {
+    const store = await createTestStore();
+    const before = await createTestCollection({ name: "before", pwd: "/test/before" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, before, "renamedhash", [vector(1, 0)]);
+    const beforeId = resolveCollectionId(store.db, before)!;
+    // A removed collection whose partition and id outlived its documents.
+    await insertVecDoc(store, "after", "leftoverhash", [vector(0.9, 0.44), vector(0.8, 0.6)]);
+    store.db.prepare(`DELETE FROM documents WHERE collection = 'after'`).run();
+    expect(vectorRowCount(store, "after")).toBe(2);
+
+    renameCollection(store.db, before, "after");
+
+    const renamed = await store.searchVec("ignored", "test-model", 3, "after", undefined, query);
+    expect(renamed.map((r) => r.hash)).toEqual(["renamedhash"]);
+    expect(renamed[0]!.collectionName).toBe("after");
+    expect(resolveCollectionId(store.db, "after")).toBe(beforeId);
+    expect(resolveCollectionId(store.db, before)).toBeUndefined();
+    expect(vectorRowCount(store, "after")).toBe(1);
+    expect((store.db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_TABLE}`).get() as { c: number }).c).toBe(1);
+    expect(documentsIn(store, "after")).toBe(1);
+    expect(storeCollectionNames(store, before, "after")).toEqual(["after"]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("renameCollection rolls back every table when a later step fails", async () => {
+    const store = await createTestStore();
+    const before = await createTestCollection({ name: "before", pwd: "/test/before" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, before, "renamedhash", [vector(1, 0)]);
+    const beforeId = resolveCollectionId(store.db, before)!;
+
+    const failing = failingDb(store.db, `UPDATE ${VEC_COLLECTION_IDS_TABLE} SET name = ?`, "injected failure renaming the vector id");
+    expect(() => renameCollection(failing, before, "after")).toThrow("injected failure renaming the vector id");
+
+    expect(documentsIn(store, before)).toBe(1);
+    expect(documentsIn(store, "after")).toBe(0);
+    expect(resolveCollectionId(store.db, before)).toBe(beforeId);
+    expect(resolveCollectionId(store.db, "after")).toBeUndefined();
+    expect(storeCollectionNames(store, before, "after")).toEqual([before]);
+    expect((await store.searchVec("ignored", "test-model", 3, before, undefined, query)).map((r) => r.hash)).toEqual(["renamedhash"]);
+
+    // The connection is left clean: a plain retry renames everything.
+    renameCollection(store.db, before, "after");
+    expect(documentsIn(store, "after")).toBe(1);
+    expect(resolveCollectionId(store.db, "after")).toBe(beforeId);
+    expect(storeCollectionNames(store, before, "after")).toEqual(["after"]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("renameCollection onto an existing collection moves nothing and keeps the target's vectors", async () => {
+    const store = await createTestStore();
+    const before = await createTestCollection({ name: "before", pwd: "/test/before" });
+    const taken = await createTestCollection({ name: "taken", pwd: "/test/taken" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, before, "renamedhash", [vector(1, 0)]);
+    await insertVecDoc(store, taken, "takenhash", [vector(0.9, 0.44)]);
+    const takenId = resolveCollectionId(store.db, taken)!;
+
+    expect(() => renameCollection(store.db, before, taken)).toThrow(`Collection '${taken}' already exists`);
+
+    expect(documentsIn(store, before)).toBe(1);
+    expect(documentsIn(store, taken)).toBe(1);
+    expect(resolveCollectionId(store.db, taken)).toBe(takenId);
+    expect(vectorRowCount(store, taken)).toBe(1);
+    expect((await store.searchVec("ignored", "test-model", 3, taken, undefined, query)).map((r) => r.hash)).toEqual(["takenhash"]);
+
+    await cleanupTestDb(store);
+  });
+
+  test("renameCollection refuses a target whose leftover id cannot be dropped yet and changes nothing", async () => {
+    const store = await createTestStore();
+    const before = await createTestCollection({ name: "before", pwd: "/test/before" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, before, "renamedhash", [vector(1, 0)]);
+    const beforeId = resolveCollectionId(store.db, before)!;
+    store.db.prepare(`INSERT INTO ${VEC_COLLECTION_IDS_TABLE} (name) VALUES ('after')`).run();
+    const leftoverId = resolveCollectionId(store.db, "after")!;
+    // A legacy table awaiting migration: partitions are not dropped until it runs.
+    store.db.exec(`CREATE VIRTUAL TABLE ${LEGACY_VEC_TABLE} USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${DIMS}] distance_metric=cosine)`);
+
+    expect(() => renameCollection(store.db, before, "after")).toThrow(/'after'.*sqlite-vec/s);
+
+    expect(documentsIn(store, before)).toBe(1);
+    expect(documentsIn(store, "after")).toBe(0);
+    expect(resolveCollectionId(store.db, before)).toBe(beforeId);
+    expect(resolveCollectionId(store.db, "after")).toBe(leftoverId);
+    expect(storeCollectionNames(store, before, "after")).toEqual([before]);
+
+    await cleanupTestDb(store);
+  });
+
   test("removeCollection drops the collection's partition and leaves the others", async () => {
     const store = await createTestStore();
     const gone = await createTestCollection({ name: "gone", pwd: "/test/gone" });
@@ -4205,6 +4373,31 @@ describe("Vector Search collection filter", () => {
     expect((await store.searchVec("ignored", "test-model", 5, cleared, undefined, query)).map((r) => r.hash)).toEqual(["sharedhash"]);
     expect(store.db.prepare(`SELECT COUNT(*) AS c FROM content_vectors WHERE hash = 'onlyhash'`).get()).toEqual({ c: 0 });
     expect(vectorRowCount(store, cleared)).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("clearAllEmbeddings for the whole index rolls back every table when the vec0 drop fails", async () => {
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "cleared", pwd: "/test/cleared" });
+    store.ensureVecTable(DIMS);
+    await insertVecDoc(store, collection, "firsthash", [vector(1, 0), vector(0.9, 0.44)]);
+    await insertVecDoc(store, collection, "secondhash", [vector(0.8, 0.6)]);
+    const count = (table: string) => (store.db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c;
+    const counts = () => ({ contentVectors: count("content_vectors"), rows: count(VEC_ROWS_TABLE), vectors: count(VEC_TABLE) });
+    expect(counts()).toEqual({ contentVectors: 3, rows: 3, vectors: 3 });
+
+    const failing = failingDb(store.db, `DROP TABLE IF EXISTS ${VEC_TABLE}`, "injected failure dropping the vec0 table");
+    expect(() => clearAllEmbeddings(failing)).toThrow("injected failure dropping the vec0 table");
+
+    expect(counts()).toEqual({ contentVectors: 3, rows: 3, vectors: 3 });
+    expect((await store.searchVec("ignored", "test-model", 5, collection, undefined, query)).map((r) => r.hash)).toEqual(["firsthash", "secondhash"]);
+
+    // The connection is left clean: a plain retry clears everything.
+    clearAllEmbeddings(store.db);
+    expect(count("content_vectors")).toBe(0);
+    expect(count(VEC_ROWS_TABLE)).toBe(0);
+    expect(store.db.prepare(`SELECT name FROM sqlite_master WHERE name = ?`).get(VEC_TABLE)).toBeFalsy();
 
     await cleanupTestDb(store);
   });
