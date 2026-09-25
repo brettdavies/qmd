@@ -1510,6 +1510,19 @@ export function isSqliteVecAvailable(): boolean {
   return _sqliteVecAvailable === true;
 }
 
+/**
+ * Drop the vec0 table and empty its rowid map in one commit. vector_rows ids
+ * are reused once the map is empty, so a map emptied without the drop hands
+ * new rows rowids that surviving vec0 rows still hold, and every later insert
+ * fails on the vec0 primary key.
+ */
+function dropVectorIndex(db: Database): void {
+  db.transaction(() => {
+    db.exec(`DROP TABLE IF EXISTS ${VEC_TABLE}`);
+    db.exec(`DELETE FROM ${VEC_ROWS_TABLE}`);
+  }).immediate();
+}
+
 function ensureVecTableInternal(db: Database, dimensions: number): void {
   if (!_sqliteVecAvailable) {
     throw createSqliteVecUnavailableError(
@@ -1529,8 +1542,7 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
         `Run 'qmd embed -f' to re-embed with the new model.`
       );
     }
-    db.exec(`DROP TABLE IF EXISTS ${VEC_TABLE}`);
-    db.exec(`DELETE FROM ${VEC_ROWS_TABLE}`);
+    dropVectorIndex(db);
   }
   createPartitionedVecTable(db, dimensions);
 }
@@ -3893,17 +3905,31 @@ export function removeCollection(db: Database, collectionName: string): { delete
 }
 
 /**
- * Rename a collection.
- * Updates both YAML config and database documents table.
+ * Rename a collection: its documents, its vector partition id, and its
+ * store_collections row.
  */
 export function renameCollection(db: Database, oldName: string, newName: string): void {
-  // Update all documents with the new collection name in database
-  db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`)
-    .run(newName, oldName);
-  renameCollectionId(db, oldName, newName);
+  // One commit: the vector id name is UNIQUE, so a rename that fails after
+  // the documents moved would leave them under a name whose partition id
+  // still belongs to the old one, and vector search would miss them.
+  db.transaction(() => {
+    renameStoreCollection(db, oldName, newName);
 
-  // Rename in store_collections
-  renameStoreCollection(db, oldName, newName);
+    // A removed collection keeps its id while sqlite-vec is not loaded to
+    // drop its partition; the renamed collection's id cannot take that name.
+    if (resolveCollectionId(db, newName) !== undefined) {
+      deleteVectorPartition(db, newName);
+      if (resolveCollectionId(db, newName) !== undefined) {
+        throw new Error(
+          `Cannot rename to '${newName}': a removed collection of that name still has a vector partition, which only qmd with sqlite-vec loaded can drop. ` +
+          `Open qmd with sqlite-vec loaded and retry the rename.`
+        );
+      }
+    }
+
+    db.prepare(`UPDATE documents SET collection = ? WHERE collection = ?`).run(newName, oldName);
+    renameCollectionId(db, oldName, newName);
+  }).immediate();
 }
 
 // =============================================================================
@@ -4570,10 +4596,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
     .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target))
     .sort((a, b) => a.distance - b.distance)
     .slice(0, limit)
-    .map((row) => {
-      const body = (bodyOf.get(row.hash) as { doc: string }).doc;
+    .flatMap((row): SearchResult[] => {
+      // The body is read after resolution, outside its snapshot: another
+      // process's orphaned-content cleanup can delete the row in between.
+      const content = bodyOf.get(row.hash) as { doc: string } | null | undefined;
+      if (content == null) return [];
+      const body = content.doc;
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
-      return {
+      return [{
         filepath: row.filepath,
         displayPath: row.display_path,
         title: row.title,
@@ -4588,7 +4618,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
         score: 1 - row.distance,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
-      };
+      }];
     });
 }
 
@@ -4645,9 +4675,10 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
  */
 export function clearAllEmbeddings(db: Database, collection?: string): void {
   if (!collection) {
-    db.exec(`DELETE FROM content_vectors`);
-    db.exec(`DELETE FROM ${VEC_ROWS_TABLE}`);
-    db.exec(`DROP TABLE IF EXISTS ${VEC_TABLE}`);
+    db.transaction(() => {
+      db.exec(`DELETE FROM content_vectors`);
+      dropVectorIndex(db);
+    }).immediate();
     return;
   }
 
@@ -4681,10 +4712,7 @@ export function clearAllEmbeddings(db: Database, collection?: string): void {
     const remaining = db
       .prepare(`SELECT COUNT(*) AS n FROM content_vectors`)
       .get() as { n: number };
-    if (remaining.n === 0) {
-      db.exec(`DELETE FROM ${VEC_ROWS_TABLE}`);
-      db.exec(`DROP TABLE IF EXISTS ${VEC_TABLE}`);
-    }
+    if (remaining.n === 0) dropVectorIndex(db);
   }).immediate());
 }
 
