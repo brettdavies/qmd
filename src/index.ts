@@ -68,6 +68,20 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import type {
+  DocumentMetadata,
+  MetadataScalar,
+  MetadataScalarArray,
+  MetadataValue,
+} from "./metadata.js";
+import {
+  parseMetadataFilter,
+  MetadataFilterError,
+  type MetadataFilter,
+  type MetadataFilterGroup,
+  type MetadataFilterNegation,
+  type MetadataCondition,
+} from "./metadata-filter.js";
 import {
   setConfigSource,
   loadConfig,
@@ -109,6 +123,19 @@ export type {
   ContextMap,
 };
 
+// Re-export metadata and metadata-filter types shared by every search surface
+export type {
+  DocumentMetadata,
+  MetadataScalar,
+  MetadataScalarArray,
+  MetadataValue,
+  MetadataFilter,
+  MetadataFilterGroup,
+  MetadataFilterNegation,
+  MetadataCondition,
+};
+export { parseMetadataFilter, MetadataFilterError };
+
 // Re-export the internal Store type for advanced consumers
 export type { InternalStore };
 
@@ -141,6 +168,7 @@ export type UpdateResult = {
   updated: number;
   unchanged: number;
   removed: number;
+  skipped: number;
   needsEmbedding: number;
 };
 
@@ -152,7 +180,7 @@ export interface SearchOptions {
   query?: string;
   /** Pre-expanded queries (from expandQuery) — skips auto-expansion */
   queries?: ExpandedQuery[];
-  /** Domain intent hint — steers expansion and reranking */
+  /** Domain intent hint — steers reranking and snippet/chunk selection */
   intent?: string;
   /** Rerank results using LLM (default: true) */
   rerank?: boolean;
@@ -160,6 +188,8 @@ export interface SearchOptions {
   collection?: string;
   /** Filter to specific collections */
   collections?: string[];
+  /** Metadata filter — every returned result satisfies it */
+  filter?: MetadataFilter;
   /** Max results (default: 10) */
   limit?: number;
   /** Max candidates to rerank (default: 40) */
@@ -177,7 +207,9 @@ export interface SearchOptions {
  */
 export interface LexSearchOptions {
   limit?: number;
-  collection?: string;
+  collection?: string | string[];
+  /** Metadata filter — every returned result satisfies it */
+  filter?: MetadataFilter;
 }
 
 /**
@@ -185,13 +217,21 @@ export interface LexSearchOptions {
  */
 export interface VectorSearchOptions {
   limit?: number;
-  collection?: string;
+  collection?: string | string[];
+  /** Metadata filter — every returned result satisfies it */
+  filter?: MetadataFilter;
 }
 
 /**
  * Options for expandQuery() — manual query expansion.
  */
 export interface ExpandQueryOptions {
+  /**
+   * @deprecated Ignored. Intent no longer feeds the expansion model — caller
+   * intent is meta-language the model reproduced verbatim as sub-queries.
+   * Pass intent via SearchOptions instead, where it shapes reranking and
+   * snippet selection.
+   */
   intent?: string;
 }
 
@@ -398,11 +438,16 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         ...(opts.collections ?? []),
       ];
       const skipRerank = opts.rerank === false;
+      // The SDK is also a JavaScript boundary: TypeScript declarations do not
+      // protect plain-JS callers or deserialized input. Apply the same bounded,
+      // strict validation used by CLI, MCP, and HTTP before compiling SQL.
+      const filter = opts.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
 
       if (opts.queries) {
         // Pre-expanded queries — use structuredSearch
         return structuredSearch(internal, opts.queries, {
           collections: collections.length > 0 ? collections : undefined,
+          filter,
           limit: opts.limit,
           minScore: opts.minScore,
           explain: opts.explain,
@@ -415,7 +460,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
       // Simple query string — use hybridQuery (expand + search + rerank)
       return hybridQuery(internal, opts.query!, {
-        collection: collections[0],
+        collection: collections.length > 0 ? collections : undefined,
+        filter,
         limit: opts.limit,
         minScore: opts.minScore,
         explain: opts.explain,
@@ -425,9 +471,15 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
-    expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
+    searchLex: async (q, opts) => {
+      const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
+      return internal.searchFTS(q, opts?.limit, opts?.collection, filter);
+    },
+    searchVector: async (q, opts) => {
+      const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
+      return internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, filter);
+    },
+    expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
       const result = internal.findDocument(pathOrDocid, { includeBody: false });
@@ -496,7 +548,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
       internal.clearCache();
 
-      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0;
+      let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
 
       for (const col of filtered) {
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
@@ -509,6 +561,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         totalUpdated += result.updated;
         totalUnchanged += result.unchanged;
         totalRemoved += result.removed;
+        totalSkipped += result.skipped;
       }
 
       return {
@@ -517,6 +570,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         updated: totalUpdated,
         unchanged: totalUnchanged,
         removed: totalRemoved,
+        skipped: totalSkipped,
         needsEmbedding: internal.getHashesNeedingEmbedding(),
       };
     },

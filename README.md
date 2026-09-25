@@ -4,7 +4,24 @@ An on-device search engine for everything you need to remember. Index your markd
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.
 
-![QMD Architecture](assets/qmd-architecture.png)
+```mermaid
+flowchart LR
+  Q[User Query] --> X[Query Expansion]
+  Q --> FTS[BM25 Search]
+  Q --> VS[Vector Search]
+  X --> HYDE[HyDE]
+  X --> VEC[Vec dense sentences]
+  X --> LEX[Lex BM25 keywords]
+  HYDE --> VS
+  VEC --> VS
+  LEX --> FTS
+  VS --> RRF[Reciprocal Rank Fusion]
+  FTS --> RRF
+  RRF --> RR[LLM Reranker]
+  RR --> OUT[Final ranked results]
+```
+
+Typed expansions are routed exclusively: `lex` → BM25/FTS, `vec` and `hyde` → vector search. The original query is sent to both backends, then fused with RRF and reranked.
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
@@ -134,7 +151,31 @@ runs in a container and a liveness probe connects from a non-loopback address.
 
 The HTTP server exposes two endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
+- `POST /query` (alias `/search`) — structured search without the MCP protocol. Accepts the same optional `filter` object as the `query` tool (invalid filters return `400`); see [Metadata Filtering](#metadata-filtering)
 - `GET /health` — liveness check with uptime
+
+
+##### Origin and Host validation
+
+Every request is screened before routing: a request carrying an `Origin` header
+that does not name a loopback address is rejected with `403`, as is a `Host`
+header naming something other than the address the server is bound to. This is
+what stops a web page you visit from reading your index through DNS rebinding —
+loopback binding alone does not, since the browser makes the request from your
+own machine.
+
+Requests without an `Origin` header — curl, MCP clients, editors — are
+unaffected, which covers every normal local client.
+
+| Variable | Effect |
+|----------|--------|
+| `QMD_ALLOWED_ORIGINS` | Comma-separated origins to accept in addition to loopback, e.g. `https://notes.internal`. Set to `*` to disable the check entirely. |
+| `QMD_ALLOWED_HOSTS` | Comma-separated `Host` values to accept in addition to loopback and the bind address. |
+
+`--host 0.0.0.0` cannot know which `Host` values are legitimate, so it skips the
+host check and warns at startup. Set `QMD_ALLOWED_HOSTS` to re-enable it, and
+remember the endpoints are unauthenticated — put your own auth in front of a
+server that is reachable off-host.
 
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 
@@ -146,6 +187,7 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 |------|-----------|------|-------|
 | `query` | `searches` | array | Typed sub-queries (`lex`/`vec`/`hyde`), 1–10. **Required.** First gets 2x weight. |
 | `query` | `collections` | string[] | Filter by collection names (OR). **Array only** — singular `collection` is silently ignored. |
+| `query` | `filter` | object | Metadata filter (recursive `operator`-discriminated JSON AST; see [Metadata Filtering](#metadata-filtering)) |
 | `query` | `intent` | string | Disambiguation context (does not search on its own) |
 | `query` | `limit` | number | Max results (default 10) |
 | `query` | `minScore` | number | Minimum relevance 0–1 (default 0) |
@@ -251,6 +293,20 @@ const results3 = await store.search({
 
 // Skip reranking for faster results
 const fast = await store.search({ query: "auth", rerank: false })
+
+// Metadata filter — every returned result satisfies it (also available on
+// searchLex() and searchVector()); results expose indexed metadata via
+// r.metadata. See "Metadata Filtering" for the full grammar.
+const published = await store.search({
+  query: "authentication flow",
+  filter: {
+    operator: "and",
+    operands: [
+      { key: "topics", operator: "all", value: ["typescript"] },
+      { key: "status", operator: "ne", value: "draft" },
+    ],
+  },
+})
 ```
 
 For direct backend access:
@@ -572,6 +628,9 @@ qmd collection add . --name myproject
 # Create a collection with explicit path and custom glob mask
 qmd collection add ~/Documents/notes --name notes --mask "**/*.md"
 
+# Comma-separated masks are a union (brace form `{a,b}` also works)
+qmd collection add ~/notes --name notes --mask "sources/**/*.md,CO - *.md"
+
 # List all collections
 qmd collection list
 
@@ -707,7 +766,7 @@ collections:
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
 | `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
-| `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. |
+| `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
 | `collections.<name>.update` | per-collection | Bash command run before `qmd update` re-indexes this collection. Set via `qmd collection update-cmd`. |
 | `collections.<name>.includeByDefault` | per-collection | Whether unscoped queries search it. Toggle with `qmd collection include`/`exclude`. Default `true`. |
@@ -748,6 +807,37 @@ qmd collection update-cmd wiki 'git pull --ff-only'   # set
 qmd collection update-cmd wiki                         # clear
 ```
 
+##### Checked-in `.qmd` config is not trusted by default
+
+A project-local `.qmd/index.yml` travels with a `git clone`, and QMD adopts it
+automatically for any command run inside the tree. Three fields in that file can
+reach outside the project, and QMD will not use them unattended:
+
+- `update` commands — somebody else's shell script, run by `qmd update`
+- `collections.*.path` pointing **outside** the project directory
+- `models.embed` / `models.rerank` / `models.generate` other than the built-in
+  defaults (any `hf:` repo or local GGUF path)
+
+In-project collection paths (for example `./docs`) still index. On a terminal
+`qmd update` (and `qmd embed` / `qmd pull` / `qmd query`) lists the gated
+fields and asks. Approving records the approval in `~/.config/qmd/trusted.json`.
+With no terminal to ask — agents, CI, MCP — those fields are **skipped** and
+in-project indexing continues.
+
+Approvals cover the exact gated set you saw. Editing a command, pointing a
+collection outside the project, or changing a custom model URI asks again.
+
+```sh
+qmd trust           # review and approve this project's gated fields
+qmd trust list      # show every approved project config
+qmd trust revoke    # drop the approval for this project
+```
+
+Set `QMD_TRUST_LOCAL_CONFIG=1` (or `QMD_TRUST_UPDATE_HOOKS=1`) for CI that
+should allow them unattended. Your own `~/.config/qmd/*.yml` — including
+anything `qmd collection update-cmd` or `qmd collection add` writes — is
+never gated.
+
 ### Search Commands
 
 ```
@@ -785,11 +875,15 @@ and `deep-search` (→ `query`).
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
 --explain          # Include retrieval score traces (query, JSON/CLI output)
+--filter <json>    # Metadata filter (recursive JSON AST; see Metadata Filtering)
 --index <name>     # Use named index
 --intent "<text>"  # Disambiguation context (e.g. "web page load times")
 --no-rerank        # Skip LLM reranking (RRF scores only; faster on CPU)
 -C, --candidate-limit <n>  # Max candidates to rerank (default: 40)
 --full-path        # Emit on-disk filesystem paths instead of qmd:// URIs
+                   # (a result whose file has moved or been deleted since
+                   #  indexing keeps its qmd:// URI + docid, and a notice is
+                   #  printed to stderr — run `qmd update` to refresh)
 
 # Output formats (for search and multi-get)
 --format <kind>    # cli (default) | json | csv | md | xml | files
@@ -824,6 +918,72 @@ explicitly with `-c`.
 > **Note:** With multiple `-c` flags, results come from a global top-K pool and are
 > then filtered. If one collection dominates the rankings, matches from smaller
 > collections may not appear at the default limit — raise `-n` or use `--all`.
+
+### Metadata Filtering
+
+Documents can opt into typed metadata through a namespaced frontmatter block. A document without `qmd.metadata` behaves exactly as before, and the frontmatter stays ordinary searchable content (no chunking, embedding, or line-number changes):
+
+```markdown
+---
+qmd:
+  metadata:
+    topics:
+      - typescript
+      - programming
+    status: published
+    priority: 3
+    reviewed: true
+---
+
+# Document body starts here
+```
+
+Supported values are strings, numbers, booleans, and flat homogeneous arrays of one of those. Nested objects, nulls, empty arrays, and mixed-type arrays are rejected (the document still indexes; it is excluded from filtered search until corrected). Metadata keys are user-defined data — `tags`, `topics`, and `labels` are all ordinary keys with no special semantics.
+
+Every search surface (CLI, SDK, MCP, HTTP) accepts the same recursive filter, a JSON AST discriminated by `operator`:
+
+```sh
+# One condition
+qmd search "authentication" \
+  --filter '{"key":"status","operator":"eq","value":"published"}'
+
+# Composed conditions — works with search, vsearch, and query
+qmd query "dependency injection" --filter '{
+  "operator": "and",
+  "operands": [
+    { "key": "topics", "operator": "all", "value": ["typescript", "programming"] },
+    { "key": "status", "operator": "nin", "value": ["draft", "archived"] },
+    { "operator": "or", "operands": [
+      { "key": "priority", "operator": "gte", "value": 3 },
+      { "key": "reviewed", "operator": "eq", "value": true }
+    ] },
+    { "operator": "not", "operand": { "key": "audience", "operator": "eq", "value": "internal" } }
+  ]
+}'
+```
+
+| Node | Shape |
+|------|-------|
+| Logical group | `{ "operator": "and" \| "or", "operands": […] }` |
+| Negation | `{ "operator": "not", "operand": {…} }` |
+| Comparison | `{ "key", "operator": "eq" \| "ne" \| "gt" \| "gte" \| "lt" \| "lte", "value" }` |
+| Membership | `{ "key", "operator": "in" \| "nin" \| "all", "value": […] }` |
+| Presence | `{ "key", "operator": "exists", "value": true \| false }` |
+
+Semantics:
+
+- Matching is typed and exact — no string/number/boolean coercion, and a type mismatch never matches (including `ne` and `nin`).
+- Array-valued metadata is a set: a condition matches when any element satisfies it, `all` requires every filter value to be present.
+- Missing keys do not match `ne`/`nin`; combine with `{ "operator": "exists", "value": false }` in an `or` group to include them.
+- Multiple conditions require an explicit `and` group — there is no implicit AND, and no `$`-prefixed shorthand.
+
+Guarantees and limits:
+
+- Every returned result satisfies the filter, before RRF fusion and reranking.
+- Like collection filtering, highly selective filters are best-effort for top-K completeness: backends over-fetch and post-filter, so a very selective filter can return fewer than `limit` results.
+- Filtered search only considers documents whose metadata has been extracted (run `qmd update` after upgrading; `qmd status` shows the pending count).
+
+JSON output (`--format json`), the SDK, MCP structured results, and the HTTP endpoints include each result's indexed metadata.
 
 ### Output Format
 
