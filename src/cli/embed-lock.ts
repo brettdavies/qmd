@@ -1,8 +1,9 @@
 /**
  * Process-level exclusive lock for `qmd embed`.
  *
- * Concurrent embed runs against the same index can race on vectors_vec
- * (UNIQUE constraint on hash_seq). This lockfile keeps a second process from
+ * Concurrent embed runs against the same index can race on vector_rows
+ * (UNIQUE constraint on hash, seq, collection_id). This lockfile keeps a
+ * second process from
  * starting while another embed holds the lock. Stale files left by crashed
  * processes are recovered via PID identity checks (same spirit as mcp-pid.ts).
  */
