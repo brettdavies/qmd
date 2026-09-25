@@ -999,15 +999,17 @@ async function updateCollections(): Promise<void> {
     console.log("");
   }
 
+  // The pending count below only sees content_vectors, so a hash that joined
+  // a collection while already embedded elsewhere would be neither counted
+  // nor searchable there; copying its rows closes that gap without a model.
+  // The copy runs before the cleanup, which deletes the partition rows the
+  // copy reads from, so a document moved between collections keeps its vectors.
+  const copiedVectors = copyVectorsToNewCollections(db).copied;
   // A changed file rewrites its document's hash in place, which strands the
   // old hash's rows in the collection's vector partition; the partition
   // filter cannot see documents.active, so those rows would take k slots
   // from a scoped search until they are removed.
   const staleVectors = cleanupOrphanedVectors(db);
-  // The pending count below only sees content_vectors, so a hash that joined
-  // a collection while already embedded elsewhere would be neither counted
-  // nor searchable there; copying its rows closes that gap without a model.
-  const copiedVectors = copyVectorsToNewCollections(db).copied;
 
   // Check if any documents need embedding (show once at end)
   const needsEmbedding = getHashesNeedingEmbedding(db);
