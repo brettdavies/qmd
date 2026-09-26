@@ -1809,6 +1809,26 @@ export async function reindexCollection(
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
+
+  // A missing root (unmounted drive, offline share, deleted folder) globs to
+  // an empty list, which the deactivation pass below would read as "every
+  // file was deleted". Leave the index alone and report the root instead.
+  let rootIsDirectory = false;
+  try {
+    rootIsDirectory = statSync(collectionPath).isDirectory();
+  } catch (error) {
+    const code = fsErrorCode(error);
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+  }
+  if (!rootIsDirectory) {
+    return {
+      indexed: 0, updated: 0, unchanged: 0, removed: 0, orphanedCleaned: 0,
+      skipped: 1,
+      skippedFiles: [{ file: collectionPath, code: "ROOT_MISSING" }],
+      metadataErrors: 0,
+    };
+  }
+
   const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
     cwd: collectionPath,
     onlyFiles: true,

@@ -1265,6 +1265,27 @@ describe("CLI Multi-Get Command", () => {
 });
 
 describe("CLI Update Command", () => {
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("reports collection root permission failures and exits non-zero", async () => {
+    const env = await createIsolatedTestEnv("update-root-permissions");
+    const parent = join(testDir, "restricted-root");
+    const collectionPath = join(parent, "docs");
+    await mkdir(collectionPath, { recursive: true });
+    await writeFile(join(collectionPath, "readme.md"), "# Readme\n\nPreserve this indexed document.\n");
+    const added = await runQmd(["collection", "add", collectionPath, "--name", "docs"], env);
+    expect(added.exitCode).toBe(0);
+    await chmod(parent, 0o000);
+    try {
+      const result = await runQmd(["update"], env);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("EACCES");
+      const search = await runQmd(["search", "Preserve", "--json"], env);
+      expect(search.exitCode).toBe(0);
+      expect(search.stdout).toContain("readme.md");
+    } finally {
+      await chmod(parent, 0o700);
+    }
+  }, 60000);
+
   let localDbPath: string;
 
   beforeEach(async () => {

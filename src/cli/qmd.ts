@@ -2116,14 +2116,17 @@ function reportMetadataErrors(metadataErrors: number): void {
 function reportSkippedReads(skippedFiles: { file: string; code: string }[]): void {
   if (skippedFiles.length === 0) return;
   for (const skipped of skippedFiles) {
-    if (skipped.code === "OUTSIDE_COLLECTION") {
+    if (skipped.code === "ROOT_MISSING") {
+      console.warn(`⚠ Collection root not found, index left unchanged: ${skipped.file}`);
+    } else if (skipped.code === "OUTSIDE_COLLECTION") {
       console.warn(`⚠ Skipped file outside collection: ${skipped.file}`);
     } else {
       console.warn(`⚠ Skipped unreadable file: ${skipped.file} (${skipped.code})`);
     }
   }
   const escaped = skippedFiles.filter(f => f.code === "OUTSIDE_COLLECTION").length;
-  const unreadable = skippedFiles.length - escaped;
+  const rootMissing = skippedFiles.filter(f => f.code === "ROOT_MISSING").length;
+  const unreadable = skippedFiles.length - escaped - rootMissing;
   if (escaped) console.warn(`Skipped ${escaped} file(s) outside the collection root`);
   if (unreadable) console.warn(`Skipped ${unreadable} unreadable file(s)`);
 }

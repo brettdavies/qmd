@@ -29,6 +29,13 @@
   collections (thanks @brettdavies). Builds on the approach in #918 (thanks
   @fxstein). #953 (thanks @Mr-Beasley)
 
+- `qmd update` no longer deactivates every document in a collection whose root
+  folder is missing, for example an unmounted drive or an offline network share.
+  The folder globbed to an empty list, which read as "every file was deleted",
+  so search went empty and a `qmd cleanup` before the drive came back deleted
+  the rows for good. The collection is now reported as not found and its index
+  is left unchanged. Permission and I/O errors still fail with their original
+  cause. (#989)
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the

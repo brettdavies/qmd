@@ -3027,6 +3027,42 @@ describe("Reindex Collection", () => {
     expect(paths.map(r => r.path)).toEqual(["X - b.md", "a.md"]);
   });
 
+  test("leaves the index unchanged when the collection root is missing", async () => {
+    const store = await createTestStore();
+    const collectionName = "unmounted";
+    const parent = join(testDir, `unmounted-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const collectionPath = join(parent, "notes");
+    await mkdir(collectionPath, { recursive: true });
+    await writeFile(join(collectionPath, "a.md"), "# A\n\nalpha\n");
+    await writeFile(join(collectionPath, "b.md"), "# B\n\nbravo\n");
+
+    try {
+      const initial = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+      expect(initial.indexed).toBe(2);
+
+      // An unmounted drive or offline share looks exactly like an empty folder to
+      // the glob. That must not read as "every file was deleted".
+      await rename(collectionPath, join(parent, "notes.unmounted"));
+      const whileMissing = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+      expect(whileMissing.removed).toBe(0);
+      expect(whileMissing.skipped).toBe(1);
+      expect(whileMissing.skippedFiles[0]!.code).toBe("ROOT_MISSING");
+
+      const active = store.db.prepare(`
+        SELECT COUNT(*) AS count FROM documents WHERE collection = ? AND active = 1
+      `).get(collectionName) as { count: number };
+      expect(active.count).toBe(2);
+
+      // A genuinely empty folder still deactivates everything.
+      await mkdir(collectionPath);
+      const whileEmpty = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+      expect(whileEmpty.removed).toBe(2);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
   test("does not index a file symlink whose target is outside the collection", async () => {
     const store = await createTestStore();
     const parent = join(testDir, `escape-sym-${Date.now()}-${Math.random().toString(36).slice(2)}`);
