@@ -1374,6 +1374,32 @@ describe("Query expansion cache (#818)", () => {
       await cleanupTestDb(store);
     }
   });
+
+  test("hybridQuery embeds each distinct cached expansion once (#921)", async () => {
+    const store = await createTestStore();
+    const embedModel = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+    const embedBatchSpy = vi.fn(async (texts: string[]) => texts.map(() => ({ embedding: [1, 2, 3], model: embedModel })));
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = { embedModelName: embedModel, embedBatch: embedBatchSpy } as any;
+    store.searchVec = vi.fn(async () => [] as SearchResult[]) as any;
+    try {
+      // The row from #921: one hyde string cached 12 times, one vec string twice.
+      const cached = [
+        ...Array.from({ length: 12 }, () => ({ type: "hyde", query: "musubi reconstruction guide" })),
+        { type: "vec", query: "methods for musubi" },
+        { type: "vec", query: "methods for musubi" },
+        { type: "lex", query: "musubi reconstruction" },
+      ];
+      store.setCachedResult(getCacheKey("expandQuery", { query: "musubi", model: DEFAULT_QUERY_MODEL }), JSON.stringify(cached));
+
+      await hybridQuery(store, "musubi", { limit: 5, minScore: 0, skipRerank: true, intent: "x" });
+
+      expect(embedBatchSpy).toHaveBeenCalledTimes(1);
+      expect(embedBatchSpy.mock.calls[0]![0]).toHaveLength(3);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 
