@@ -6298,15 +6298,14 @@ export async function structuredSearch(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
   ).get();
 
-  // One query for the whole scope. searchFTS/searchVec already take a list, so
-  // looping the collections here only split one result set into N ranked lists,
-  // and RRF then treated each collection's best-of-a-bad-lot as a rank 1.
-  const collScope = collections && collections.length > 0 ? collections : undefined;
+  // Each search yields ONE ranked list over the union of the named collections
+  // (undefined = all). searchFTS/searchVec merge per-collection results by score,
+  // so the RRF weight below boosts the first search, not the first collection.
 
   // Step 1: Run FTS for all lex searches (sync, instant)
   for (const search of searches) {
     if (search.type === 'lex') {
-      const ftsResults = store.searchFTS(search.query, 20, collScope, filter);
+      const ftsResults = store.searchFTS(search.query, 20, collections, filter);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -6342,7 +6341,7 @@ export async function structuredSearch(
         if (!embedding) continue;
 
         const vecResults = await store.searchVec(
-          vecSearches[i]!.query, embedModel, 20, collScope,
+          vecSearches[i]!.query, embedModel, 20, collections,
           undefined, embedding, filter
         );
         if (vecResults.length > 0) {
