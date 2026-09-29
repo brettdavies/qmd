@@ -245,17 +245,68 @@ describe("qmd cleanup vector repack", () => {
     const s = await openStore();
     await seedVectors(s, HOLEY.total, HOLEY.keep, "alpha", "alpha");
     await seedVectors(s, HOLEY.total, HOLEY.keep, "beta", "beta");
-    expect(vectorTableLayout(s.db)).toEqual({ rows: 6, chunks: 4, neededChunks: 1, occupancy: 0.25 });
+    // Rows of different partitions never share a chunk: a packed copy needs one chunk each.
+    expect(vectorTableLayout(s.db)).toEqual({ rows: 6, chunks: 4, neededChunks: 2, occupancy: 0.5 });
 
     const stats = runCleanup(s.db);
 
     expect(stats.vectorsRepacked).toBe(true);
-    expect(vectorTableLayout(s.db)).toEqual({ rows: 6, chunks: 2, neededChunks: 1, occupancy: 0.5 });
+    expect(vectorTableLayout(s.db)).toEqual({ rows: 6, chunks: 2, neededChunks: 2, occupancy: 1 });
+    expect(runCleanup(s.db).vectorsRepacked).toBe(false);
     expect(partitionCount(s, "alpha")).toBe(3);
     expect(partitionCount(s, "beta")).toBe(3);
     const alpha = await searchVec(s.db, "ignored", "test-model", 5, "alpha", undefined, [1, 0, 0]);
     expect(alpha.map((r) => r.hash).sort()).toEqual(["alpha00000", "alpha00001", "alpha01099"]);
     const beta = await searchVec(s.db, "ignored", "test-model", 5, "beta", undefined, [1, 0, 0]);
     expect(beta.map((r) => r.hash).sort()).toEqual(["beta00000", "beta00001", "beta01099"]);
+  });
+
+  test("a table below the occupancy trigger with no chunk to move is not repacked", async () => {
+    const s = await openStore();
+    // Two chunks at 973 of 1024 slots (above the per-chunk fill) and a newest chunk of 51.
+    const keep = Array.from({ length: 2099 }, (_, i) => i).filter((i) => !(i <= 50 || (i >= 1024 && i <= 1074)));
+    await seedVectors(s, 2099, keep);
+    expect(vectorTableLayout(s.db)).toEqual({ rows: 1997, chunks: 3, neededChunks: 2, occupancy: 2 / 3 });
+
+    expect(previewCleanup(s.db).vectorsRepacked).toBe(false);
+    expect(runCleanup(s.db).vectorsRepacked).toBe(false);
+  });
+
+  test("previewCleanup leaves out a chunk that orphan removal empties, as runCleanup finds it", async () => {
+    const s = await openStore();
+    await seedVectors(s, 1100, Array.from({ length: 1100 }, (_, i) => i));
+    s.db.transaction(() => {
+      for (let i = 0; i < 1024; i++) deactivateDocument(s.db, "docs", `${hashOf("vec", i)}.md`);
+    })();
+
+    const preview = previewCleanup(s.db);
+    expect(preview).toMatchObject({ orphanedVectors: 1024, vectorsRepacked: false, vectorLayout: { rows: 76, chunks: 1, neededChunks: 1, occupancy: 1 } });
+
+    const stats = runCleanup(s.db);
+    expect(stats.vectorsRepacked).toBe(false);
+    expect(stats.vectorLayout).toEqual(preview.vectorLayout);
+  });
+
+  test("a repack reads each chunk again, so a rowid reused by another partition stays there", async () => {
+    const s = await openStore();
+    // Alpha holds two sparse chunks and a newest one; beta is small and packed.
+    await seedVectors(s, 2100, [0, 1, 1024, 1025, 2099], "alpha", "alpha");
+    await seedVectors(s, 3, [0, 1, 2], "beta", "beta");
+    const betaId = resolveCollectionId(s.db, "beta")!;
+    const reused = (s.db.prepare(`SELECT id FROM ${VEC_ROWS_TABLE} WHERE hash = ?`).get(hashOf("alpha", 1024)) as { id: number }).id;
+
+    repackVectors(s.db, (done) => {
+      if (done !== 1) return;
+      // Between two chunk transactions, another writer drops a row of the second
+      // sparse chunk and a beta embed takes over its rowid.
+      deletePartitionRows(s.db, [reused]);
+      s.db.prepare(`INSERT INTO ${VEC_ROWS_TABLE} (id, hash, seq, collection_id) VALUES (?, ?, 0, ?)`).run(reused, "betanew", betaId);
+      s.db.prepare(`INSERT INTO ${VEC_TABLE} (rowid, collection_id, embedding) VALUES (?, ?, ?)`).run(vecInteger(reused), vecInteger(betaId), new Float32Array([0, 1, 0]));
+    });
+
+    const row = s.db.prepare(`SELECT collection_id AS collectionId FROM ${VEC_TABLE} WHERE rowid = ?`).get(vecInteger(reused)) as { collectionId: number };
+    expect(row.collectionId).toBe(betaId);
+    expect(partitionCount(s, "alpha")).toBe(4);
+    expect(partitionCount(s, "beta")).toBe(4);
   });
 });
