@@ -18,6 +18,7 @@ import {
   hashContent,
   insertContent,
   insertDocument,
+  searchFTS,
   structuredSearch,
   validateSemanticQuery,
   validateLexQuery,
@@ -367,6 +368,19 @@ describe("structuredSearch", () => {
     for (const collections of [["alpha", "beta"], ["beta", "alpha"]]) {
       const results = await structuredSearch(store, searches, { collections, skipRerank: true });
       expect(results.map(r => r.displayPath)).toEqual(unscoped.map(r => r.displayPath));
+    }
+  });
+
+  test("an exact tie between collections goes the same way whichever is named first", async () => {
+    const now = new Date().toISOString();
+    const body = "quillmarrow notes";
+    const hash = await hashContent(body);
+    insertContent(store.db, hash, body, now);
+    insertDocument(store.db, "alpha", "same.md", "same.md", hash, now, now);
+    insertDocument(store.db, "beta", "same.md", "same.md", hash, now, now);
+
+    for (const collections of [["alpha", "beta"], ["beta", "alpha"]]) {
+      expect(searchFTS(store.db, "quillmarrow", 1, collections).map(r => r.filepath)).toEqual(["qmd://alpha/same.md"]);
     }
   });
 });
