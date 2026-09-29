@@ -3091,6 +3091,36 @@ describe("Reindex Collection file sync state (#962)", () => {
     }
   });
 
+  test("a touched file whose content is unchanged refreshes its sync row without re-indexing", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-touch");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      const touched = new Date("2026-01-02T03:05:05Z");
+      await utimes(file, touched, touched);
+
+      const first = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(first).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+      const row = store.db.prepare(`SELECT mtime_ms FROM file_sync_state WHERE collection = ? AND relative_path = ?`)
+        .get("notes", "doc.md") as { mtime_ms: number };
+      expect(row.mtime_ms).toBe(touched.getTime());
+
+      // The refreshed row puts the file back on the fast path: a read would now report EACCES.
+      await chmod(file, 0o000);
+      const second = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(second.skippedFiles).toEqual([]);
+      expect(second).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await chmod(file, 0o644);
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
   test("files over 10 MB are skipped with FILE_TOO_LARGE and not indexed", async () => {
     const store = await createTestStore();
     const dir = await collectionDir("sync-too-large");
