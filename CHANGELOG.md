@@ -30,6 +30,11 @@
 
 ### Changed
 
+- The MCP server caches its instructions per store for up to 60 seconds instead
+  of rebuilding them, with a full index-status scan, for every HTTP request.
+  Concurrent requests share one build and a failed build is not cached; index
+  changes from other processes show up in the instructions within a minute.
+  #815 (thanks @fxstein)
 - Avoid a redundant runtime process on packaged CLI calls where the launcher is
   already running under its selected Node or Bun runtime.
 
