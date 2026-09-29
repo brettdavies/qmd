@@ -1400,6 +1400,51 @@ describe("Query expansion cache (#818)", () => {
       await cleanupTestDb(store);
     }
   });
+
+  test("expandQuery drops repeated lines from fresh model output before caching them", async () => {
+    const store = await createTestStore();
+    const generateModelName = "dedupe-generate-model";
+    store.llm = {
+      generateModelName,
+      expandQuery: async () => [
+        { type: "hyde", text: "g" }, { type: "hyde", text: "g" }, { type: "hyde", text: "g" },
+        { type: "vec", text: "v" }, { type: "vec", text: "v" },
+      ],
+    } as any;
+    try {
+      const expanded = await store.expandQuery("q");
+      expect(expanded).toEqual([{ type: "hyde", query: "g" }, { type: "vec", query: "v" }]);
+      const cached = store.getCachedResult(getCacheKey("expandQuery", { query: "q", model: generateModelName }));
+      expect(JSON.parse(cached!)).toHaveLength(2);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("vectorSearchQuery searches each distinct cached expansion once", async () => {
+    const store = await createTestStore();
+    const embedModel = "dedupe-embed-model";
+    store.ensureVecTable(3);
+    store.llm = { embedModelName: embedModel } as any;
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]);
+    store.searchVec = searchVecSpy as any;
+    try {
+      const cached = [
+        ...Array.from({ length: 12 }, () => ({ type: "hyde", query: "g" })),
+        { type: "vec", query: "v" },
+        { type: "vec", query: "v" },
+      ];
+      store.setCachedResult(getCacheKey("expandQuery", { query: "q", model: DEFAULT_QUERY_MODEL }), JSON.stringify(cached));
+
+      await vectorSearchQuery(store, "q", { limit: 5 });
+
+      // The original query plus one search per distinct expansion.
+      expect(searchVecSpy).toHaveBeenCalledTimes(3);
+      expect(searchVecSpy.mock.calls.map(call => call[0])).toEqual(["q", "g", "v"]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 
