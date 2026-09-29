@@ -3210,6 +3210,44 @@ describe("Reindex Collection file sync state (#962)", () => {
     }
   });
 
+  test("a file whose document was deactivated elsewhere is re-indexed", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-deactivated");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Unchanged file and sync row; only the document went inactive.
+      store.deactivateDocument("notes", "doc.md");
+
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a file whose document now points at other content is re-read", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-rehashed");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Unchanged file and sync row; only the document's content changed.
+      const now = new Date().toISOString();
+      store.insertContent("elsewhere-hash", "# A\n\nwritten elsewhere\n", now);
+      const doc = store.db.prepare(`SELECT id FROM documents WHERE collection = ? AND path = ?`)
+        .get("notes", "doc.md") as { id: number };
+      store.updateDocument(doc.id, "A", "elsewhere-hash", now);
+
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
   test("searchFTS returns at most 256 KiB of a document body", async () => {
     const store = await createTestStore();
     try {
