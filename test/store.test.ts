@@ -3518,6 +3518,59 @@ describe("Reindex Collection file sync state (#962)", () => {
   });
 });
 
+describe("Collection-scoped keyword search", () => {
+  // Short noise documents with the term in their titles outrank, globally, one
+  // long target in each of two small collections. The old scoped search took a
+  // global top (limit * 10) and filtered it, so the noise must fill that window.
+  async function crowdedCollections(store: Store, noiseCount: number): Promise<{ smallA: string; smallB: string }> {
+    const large = await createTestCollection({ name: "crowd-large", pwd: "/test/crowd-large" });
+    const smallA = await createTestCollection({ name: "crowd-small-a", pwd: "/test/crowd-small-a" });
+    const smallB = await createTestCollection({ name: "crowd-small-b", pwd: "/test/crowd-small-b" });
+    for (let i = 0; i < noiseCount; i++) {
+      await insertTestDocument(store.db, large, {
+        name: `noise-${i}`,
+        title: `zebra zebra ${i}`,
+        body: `# Noise ${i}\n\nzebra zebra zebra, noise document ${i}.`,
+        displayPath: `noise-${i}.md`,
+      });
+    }
+    for (const collection of [smallA, smallB]) {
+      await insertTestDocument(store.db, collection, {
+        name: `target-${collection}`,
+        title: "Target",
+        body: `# Target\n\n${"filler prose without the search term. ".repeat(40)}zebra.`,
+        displayPath: "target.md",
+      });
+    }
+    return { smallA, smallB };
+  }
+
+  test("searchFTS over two crowded-out collections returns a match from each", async () => {
+    const store = await createTestStore();
+    try {
+      const { smallA, smallB } = await crowdedCollections(store, 40);
+      const results = store.searchFTS("zebra", 2, [smallA, smallB]);
+      expect(results.map(r => r.displayPath).sort()).toEqual([`${smallA}/target.md`, `${smallB}/target.md`]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("structuredSearch over two crowded-out collections returns a match from each", async () => {
+    const store = await createTestStore();
+    try {
+      // structuredSearch asks searchFTS for 20 results, a window of 200.
+      const { smallA, smallB } = await crowdedCollections(store, 250);
+      const results = await structuredSearch(store, [{ type: "lex", query: "zebra" }], {
+        collections: [smallA, smallB], skipRerank: true,
+      });
+      expect(results.map(r => r.displayPath).sort()).toEqual([`${smallA}/target.md`, `${smallB}/target.md`]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+});
+
 // =============================================================================
 // Index Status Tests
 // =============================================================================
