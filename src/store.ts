@@ -42,6 +42,7 @@ import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js
 import {
   initializeMetadataSchema,
   syncDocumentMetadata,
+  isDocumentMetadataCurrent,
   countDocumentsPendingMetadata,
   getMetadataByFilepath,
   parseMetadataJson,
@@ -1783,7 +1784,11 @@ export async function reindexCollection(
 
     // Fast-path: stat matches cached sync state — skip read entirely
     const cached = syncStateMap.get(path);
-    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size) {
+    // Missing or stale metadata (an index from before the metadata schema, or
+    // an extraction-version bump) needs the content, so such a file is read and
+    // re-extracted through the hash-match branch below.
+    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size
+      && isDocumentMetadataCurrent(db, cached.document_id)) {
       unchanged++;
       processed++;
       options?.onProgress?.({ file: relativeFile, current: processed, total });
