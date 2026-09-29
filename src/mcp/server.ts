@@ -193,7 +193,10 @@ const instructionsCache = new WeakMap<QMDStore, { promise: Promise<string>; buil
 
 function getInstructions(store: QMDStore): Promise<string> {
   const cached = instructionsCache.get(store);
-  if (cached && Date.now() - cached.builtAt < INSTRUCTIONS_CACHE_TTL_MS) {
+  // A negative age means the clock stepped back since the build; that entry is
+  // not known to be fresh, so it is rebuilt rather than kept past the TTL.
+  const age = cached ? Date.now() - cached.builtAt : -1;
+  if (cached && age >= 0 && age < INSTRUCTIONS_CACHE_TTL_MS) {
     return cached.promise;
   }
   const promise = buildInstructions(store);

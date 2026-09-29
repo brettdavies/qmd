@@ -1515,6 +1515,20 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
       clock.mockRestore();
     }
   });
+
+  test("server/discover rebuilds an entry stamped ahead of the clock once the clock steps back", async () => {
+    const realNow = Date.now.bind(Date);
+    // Built while the clock read ten minutes ahead, as after a backward step.
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 20 * 60_000);
+    const ahead = await discoverInstructions(28);
+    clock.mockRestore();
+    addDocument("instructions-cache-clock-step");
+
+    const rebuilt = await discoverInstructions(29);
+    expect(rebuilt.status).toBe(200);
+    expect(rebuilt.instructions).not.toBe(ahead.instructions);
+    expect(documentCount(rebuilt.instructions)).toBe(activeDocuments());
+  });
 });
 
 
