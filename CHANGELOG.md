@@ -24,7 +24,7 @@
   `limit * 10` candidate window (#922). The scope is now applied to the full
   FTS5 match set, materialized once, so `search -c <collection>` is exact for
   common terms; unscoped search keeps its early-terminating plan. Builds on
-  the approach in #918.
+  the approach in #918 (thanks @fxstein). #953 (thanks @Mr-Beasley)
 
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
