@@ -1695,6 +1695,24 @@ function deleteFileSyncStateForCollection(db: Database, collectionName: string, 
 const REINDEX_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 /**
+ * Deactivate a previously indexed file that can no longer be indexed (it
+ * became empty or grew past REINDEX_MAX_FILE_SIZE) and drop its sync row, so
+ * its old content stops being searchable.
+ */
+function retireIndexedFile(
+  db: Database,
+  collectionName: string,
+  path: string,
+  livePaths: ReadonlySet<string>,
+  syncStateMap: Map<string, FileSyncStateRow>,
+): void {
+  if (!findOrMigrateLegacyDocument(db, collectionName, path, livePaths)) return;
+  deactivateDocument(db, collectionName, path);
+  deleteFileSyncStateForCollection(db, collectionName, path);
+  syncStateMap.delete(path);
+}
+
+/**
  * Re-index a single collection by scanning the filesystem and updating the database.
  * Uses mtime+size fast-path (file_sync_state) to avoid re-reading unchanged files.
  * Pure function — no console output, no db lifecycle management.
@@ -1776,6 +1794,7 @@ export async function reindexCollection(
 
     // Skip large files (>10MB) — prevents OOM
     if (size > REINDEX_MAX_FILE_SIZE) {
+      retireIndexedFile(db, collectionName, path, livePaths, syncStateMap);
       processed++;
       skippedFiles.push({ file: relativeFile, code: "FILE_TOO_LARGE" });
       options?.onProgress?.({ file: relativeFile, current: processed, total });
@@ -1811,12 +1830,7 @@ export async function reindexCollection(
 
     if (!content.trim()) {
       // Empty file — if previously indexed, deactivate it (treat as removed)
-      const existingEmpty = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
-      if (existingEmpty) {
-        deactivateDocument(db, collectionName, path);
-        deleteFileSyncStateForCollection(db, collectionName, path);
-        syncStateMap.delete(path);
-      }
+      retireIndexedFile(db, collectionName, path, livePaths, syncStateMap);
       processed++;
       options?.onProgress?.({ file: relativeFile, current: processed, total });
       continue;
