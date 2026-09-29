@@ -4339,6 +4339,20 @@ describe("Embedding batching", () => {
     expect(adoption.reason).toMatch(/^sample document-0_0 matched/);
   });
 
+  test("legacy fingerprint adoption reads one copy of a body shared by 200 active paths within a 16 MiB SQLite budget", () => {
+    // One legacy chunk, so only the active-path count multiplies the body. The
+    // limit binds under Bun only, as in the 128 MiB test above.
+    const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+    const worker = join(projectRoot, "test", "_helpers", "legacy-adoption-shared-body-worker.ts");
+    const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
+    const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60_000 });
+
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ checked: true, adopted: 1 });
+  });
+
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
     const store = await createTestStore();
     const db = store.db;
