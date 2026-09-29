@@ -1783,6 +1783,20 @@ function retireIndexedFile(
 }
 
 /**
+ * Whether a collection's root directory is gone or unreadable, as when a
+ * drive is unmounted or the directory moved. Reindexing it would find no
+ * files and retire every document, and update's vector cleanup would then
+ * delete their vectors, so update skips such a collection instead.
+ */
+export function collectionRootMissing(path: string): boolean {
+  try {
+    return !statSync(path).isDirectory();
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Re-index a single collection by scanning the filesystem and updating the database.
  * Uses mtime+size fast-path (file_sync_state) to avoid re-reading unchanged files.
  * Pure function — no console output, no db lifecycle management.

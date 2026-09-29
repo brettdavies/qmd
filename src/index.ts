@@ -25,6 +25,7 @@ import {
   addLineNumbers,
   DEFAULT_MULTI_GET_MAX_BYTES,
   reindexCollection,
+  collectionRootMissing,
   generateEmbeddings,
   listCollections as storeListCollections,
   syncConfigToDb,
@@ -175,6 +176,12 @@ export type UpdateResult = {
   /** Vector rows copied into the partition of a collection that gained an already-embedded hash. */
   vectorsCopied: number;
   needsEmbedding: number;
+  /**
+   * Collections not updated because their directory is missing or unreadable;
+   * their documents and vectors are left as they were. removeCollection drops
+   * one that is gone for good.
+   */
+  missingCollections: string[];
 };
 
 /**
@@ -554,8 +561,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       internal.clearCache();
 
       let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0, totalSkipped = 0;
+      const missingCollections: string[] = [];
 
       for (const col of filtered) {
+        if (collectionRootMissing(col.path)) {
+          missingCollections.push(col.name);
+          continue;
+        }
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
           ignorePatterns: col.ignore,
           onProgress: updateOpts?.onProgress
@@ -588,6 +600,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         staleVectorsRemoved,
         vectorsCopied,
         needsEmbedding: internal.getHashesNeedingEmbedding(),
+        missingCollections,
       };
     },
 
