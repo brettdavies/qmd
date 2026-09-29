@@ -6,8 +6,10 @@
 
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
+  #978 (thanks @naveenspark)
 - Vector diagnostics match passages by their saved character position, avoiding
   false mismatches when earlier chunks change the sequence numbering.
+  #978 (thanks @naveenspark)
 
 ### Added
 
@@ -26,7 +28,7 @@
   materialized the full body once per legacy chunk and per active path before
   `LIMIT 1` discarded it, the same pattern as the doctor vector-sample check
   (#978). It now picks the sample row through indexes and loads only that
-  row's body; the sampled chunk is unchanged. #994 (thanks @mjaverto)
+  row's body; the sampled chunk is unchanged (#994). #995 (thanks @mjaverto)
 
 ### Changed
 
@@ -36,7 +38,7 @@
   changes from other processes show up in the instructions within a minute.
   #815 (thanks @fxstein)
 - Avoid a redundant runtime process on packaged CLI calls where the launcher is
-  already running under its selected Node or Bun runtime.
+  already running under its selected Node or Bun runtime. #923 (thanks @ilepn)
 
 ## [2.8.3] - 2026-08-16
 
