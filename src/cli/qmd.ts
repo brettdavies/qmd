@@ -83,6 +83,7 @@ import {
   createStore,
   getDefaultDbPath,
   reindexCollection,
+  collectionRootMissing,
   REINDEX_MAX_FILE_SIZE,
   generateEmbeddings,
   maybeAdoptLegacyEmbeddingFingerprint,
@@ -939,6 +940,11 @@ async function updateCollections(): Promise<void> {
     if (!hooksAllowed && isLocalConfigPath(configPath) && !isCollectionPathInsideProject(configPath, rawPath)) {
       console.log(`${c.yellow}Skipping collection '${col.name}' — path ${rawPath} is outside this project and this .qmd config is not trusted.${c.reset}`);
       console.log(`${c.dim}Approve with 'qmd trust'.${c.reset}\n`);
+      continue;
+    }
+    if (collectionRootMissing(col.pwd)) {
+      console.warn(`${c.yellow}⚠ Skipping collection '${col.name}': ${col.pwd} is missing or not a readable directory. Its documents and vectors are left as they are.${c.reset}`);
+      console.warn(`${c.dim}  Remount or restore it, or remove a collection that is gone for good with 'qmd collection remove ${col.name}'.${c.reset}\n`);
       continue;
     }
     if (yamlCol?.update && hooksAllowed) {

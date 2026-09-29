@@ -1104,6 +1104,28 @@ describe("embed", () => {
     }
   });
 
+  test("store.update skips a collection whose directory is missing and reports it", async () => {
+    const root = join(testDir, `missing-root-${Date.now()}`);
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "kept.md"), "# Kept\n\nstill here\n");
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: { collections: { mounted: { path: root, pattern: "**/*.md" } } },
+    });
+    try {
+      await store.update();
+      await rename(root, `${root}-unmounted`);
+
+      const result = await store.update();
+      expect(result.missingCollections).toEqual(["mounted"]);
+      expect(result.removed).toBe(0);
+      const row = store.internal.db.prepare(`SELECT active FROM documents WHERE path = 'kept.md'`).get();
+      expect(row).toEqual({ active: 1 });
+    } finally {
+      await store.close();
+    }
+  });
+
   test("store.update drops stale vector rows and copies rows into a collection that gained an embedded hash", async () => {
     const leftDir = join(testDir, `vector-rows-left-${Date.now()}`);
     const rightDir = join(testDir, `vector-rows-right-${Date.now()}`);

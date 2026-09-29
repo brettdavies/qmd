@@ -94,6 +94,11 @@
   even when one long document holds all of the nearest chunks. Downgrading
   to an older qmd afterwards needs `qmd embed -f`, and a `qmd mcp` server
   started before the upgrade must be restarted.
+- `qmd update` skips a collection whose directory is missing or unreadable,
+  such as one on an unmounted drive, and leaves its documents and vectors as
+  they were instead of retiring them. It warns and names
+  `qmd collection remove <name>` for a collection that is gone for good. The
+  SDK's `update()` lists such collections in `missingCollections`.
 
 ## [2.8.3] - 2026-08-16
 
