@@ -4729,10 +4729,11 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const bodyOf = db.prepare(`SELECT substr(doc, 1, 262144) AS doc FROM content WHERE hash = ?`);
 
   // Each target yields its own nearest `limit` documents (or all it holds), so
-  // merging them by distance gives the scope's exact nearest `limit`.
+  // merging them by distance gives the scope's exact nearest `limit`. Ties go
+  // to the smaller filepath, as in mergeSearchResultsByScore.
   return scanTargets
     .flatMap(target => nearestVecDocuments(scan, resolve, queryVec, limit, target))
-    .sort((a, b) => a.distance - b.distance)
+    .sort((a, b) => a.distance - b.distance || compareFilepaths(a, b))
     .slice(0, limit)
     .flatMap((row): SearchResult[] => {
       // The body is read after resolution, outside its snapshot: another

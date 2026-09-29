@@ -4267,6 +4267,23 @@ describe("Integration", () => {
 // =============================================================================
 
 describe("Vector Search collection filter", () => {
+  test("an exact vector tie between collections goes the same way whichever is named first", async () => {
+    const store = await createTestStore();
+    const alpha = await createTestCollection({ name: "alpha", pwd: "/test/alpha" });
+    const beta = await createTestCollection({ name: "beta", pwd: "/test/beta" });
+    store.ensureVecTable(3);
+    for (const collection of [alpha, beta]) {
+      await insertTestDocument(store.db, collection, { name: "same", hash: "samehash", body: "Same body", displayPath: "same.md" });
+    }
+    store.insertEmbedding("samehash", 0, 0, new Float32Array([1, 0, 0]), "test", new Date().toISOString());
+
+    for (const collections of [["alpha", "beta"], ["beta", "alpha"]]) {
+      const results = await store.searchVec("ignored", "test-model", 1, collections, undefined, [1, 0, 0]);
+      expect(results.map(r => r.filepath)).toEqual(["qmd://alpha/same.md"]);
+    }
+    await cleanupTestDb(store);
+  });
+
   test("searchVec finds docs in a small collection crowded by a large one (#791, #803)", async () => {
     const store = await createTestStore();
     const large = await createTestCollection({ name: "large", pwd: "/test/large" });
