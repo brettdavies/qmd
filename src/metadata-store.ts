@@ -150,7 +150,8 @@ export function replaceDocumentMetadata(db: Database, documentId: number, extrac
   replace();
 }
 
-function isDocumentMetadataCurrent(db: Database, documentId: number): boolean {
+/** Whether a document has a metadata extraction row at the current extraction version. */
+export function isDocumentMetadataCurrent(db: Database, documentId: number): boolean {
   const row = db.prepare(`SELECT extraction_version FROM document_metadata WHERE document_id = ?`)
     .get(documentId) as { extraction_version: number } | undefined;
   return row?.extraction_version === METADATA_EXTRACTION_VERSION;
