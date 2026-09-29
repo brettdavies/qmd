@@ -72,11 +72,10 @@
   #1000 (thanks @ParkerRex)
 - Structured searches over several collections (`qmd query` with
   `lex:`/`vec:`/`hyde:` lines, the MCP `query` tool, SDK `queries`) run one
-  keyword and one vector search per line over the whole collection list and
-  fuse one ranked list per search. Rankings no longer depend on the order the
-  collections are named, and `collections: []` searches every collection
-  instead of returning nothing. #946 (thanks @shalom-t), #1009 (thanks
-  @xidus90)
+  search per line over the whole collection list, a keyword search for a
+  `lex:` line and a vector search for a `vec:` or `hyde:` line, and fuse one
+  ranked list per search. Rankings no longer depend on the order the
+  collections are named. #946 (thanks @shalom-t), #1009 (thanks @xidus90)
 
 ## [2.8.3] - 2026-08-16
 
