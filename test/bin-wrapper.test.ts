@@ -367,6 +367,49 @@ describe("bin/qmd package wrapper", () => {
     expect(Number(readFileSync(capturePath, "utf8"))).toBe(result.pid);
   });
 
+  test("an in-process dist import keeps the CLI's argv and exit status", () => {
+    const { root, capturePath } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd");
+    const distEntry = join(packageRoot, "dist", "cli", "qmd.js");
+    writeFileSync(
+      distEntry,
+      guardedEsmCli('writeFileSync(process.env.QMD_WRAPPER_CAPTURE, JSON.stringify({ pid: process.pid, argv: process.argv.slice(1) })); process.exit(3);'),
+    );
+
+    const result = spawnSync(REAL_NODE, [join(packageRoot, "bin", "qmd"), "search", "x"], {
+      env: { ...process.env, QMD_WRAPPER_CAPTURE: capturePath },
+      encoding: "utf8",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(3);
+    const captured = JSON.parse(readFileSync(capturePath, "utf8"));
+    expect(captured.pid).toBe(result.pid);
+    expect(realpathSync(captured.argv[0])).toBe(realpathSync(distEntry));
+    expect(captured.argv.slice(1)).toEqual(["search", "x"]);
+  });
+
+  test("a Node launch of a Bun-locked package still hands off to a bun child", () => {
+    const { root, capturePath, runtimeBin } = makeTempFixture();
+    const packageRoot = makePackage(root, "node_modules/@tobilu/qmd", ["bun.lock"]);
+    writeFileSync(
+      join(packageRoot, "dist", "cli", "qmd.js"),
+      guardedEsmCli('writeFileSync(process.env.QMD_WRAPPER_CAPTURE, "in-process\\n");'),
+    );
+
+    const result = spawnSync(REAL_NODE, [join(packageRoot, "bin", "qmd"), "search", "x"], {
+      env: { ...process.env, PATH: `${runtimeBin}${delimiter}${process.env.PATH ?? ""}`, QMD_WRAPPER_CAPTURE: capturePath },
+      encoding: "utf8",
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    const [runtime, scriptPath, ...args] = readFileSync(capturePath, "utf8").trimEnd().split("\n");
+    expect(runtime).toBe("bun");
+    expect(realpathSync(scriptPath)).toBe(realpathSync(join(packageRoot, "dist", "cli", "qmd.js")));
+    expect(args).toEqual(["search", "x"]);
+  });
+
   test("explains how to build when dist is missing and source cannot run", () => {
     const { root, runtimeBin } = makeTempFixture();
     const packageRoot = makePackage(root, "qmd", [], { dist: false });
