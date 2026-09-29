@@ -3076,6 +3076,8 @@ describe("Reindex Collection file sync state (#962)", () => {
     const file = join(dir, "doc.md");
     try {
       await writeFile(file, "# A\n\nalpha\n");
+      // Older than the racy window, so the first pass stores a trusted row.
+      await utimes(file, new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
       await reindexCollection(store, dir, "**/*.md", "notes");
       // Stat still works on an unreadable file; a read would fail with EACCES.
       await chmod(file, 0o000);
@@ -3116,6 +3118,29 @@ describe("Reindex Collection file sync state (#962)", () => {
       expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
     } finally {
       await chmod(file, 0o644);
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a same-size rewrite that keeps a recent mtime is still read", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-racy");
+    const file = join(dir, "doc.md");
+    try {
+      // A whole second ahead of the clock: inside the racy window however slow the run.
+      const mtime = new Date((Math.floor(Date.now() / 1000) + 1) * 1000);
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, mtime, mtime);
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Rewritten within the same mtime granule: same size, same mtime.
+      await writeFile(file, "# A\n\nbravo\n");
+      await utimes(file, mtime, mtime);
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result).toMatchObject({ indexed: 0, updated: 1, unchanged: 0 });
+      expect(activeBody(store, "notes", "doc.md")).toContain("bravo");
+    } finally {
       await rm(dir, { recursive: true, force: true });
       await cleanupTestDb(store);
     }
