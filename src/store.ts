@@ -4545,7 +4545,6 @@ interface VecMatch {
 /** One KNN scan target: a partition (or the whole table) and the rows a filter admits in it. */
 interface VecScanTarget {
   collectionId?: number;
-  eligibleRowids?: readonly number[];
 }
 
 /** The document behind a vector match, at its nearest chunk. */
@@ -4579,12 +4578,15 @@ function compileCurrentMetadataFilter(filter: MetadataFilter): { sql: string; pa
  * whole index and is never crowded out by a larger one (#775, #791, #803). A
  * `rowid IN` restriction is applied inside the scan the same way, so a
  * selective metadata filter gets an exact top-k of its own rows instead of
- * whatever survives a post-filter of a larger top-k.
+ * whatever survives a post-filter of a larger top-k. The restriction is the
+ * eligibility subquery itself rather than a bound list of rowids, so however
+ * many rows a filter admits, none of them is read onto the heap.
  */
-function knnVecScanner(db: Database, partitioned: boolean, restricted: boolean): (embedding: Float32Array, k: number, target: VecScanTarget) => VecMatch[] {
+function knnVecScanner(db: Database, partitioned: boolean, filter?: MetadataFilter): (embedding: Float32Array, k: number, target: VecScanTarget) => VecMatch[] {
   const conditions = ["embedding MATCH ?", "k = ?"];
   if (partitioned) conditions.push("collection_id = ?");
-  if (restricted) conditions.push("rowid IN (SELECT value FROM json_each(?))");
+  const eligible = filter ? metadataEligibleRowsSql(filter) : undefined;
+  if (eligible) conditions.push(`rowid IN (SELECT vr.id ${eligible.sql}${partitioned ? " AND vr.collection_id = ?" : ""})`);
   const statement = db.prepare(`
     SELECT rowid, distance
     FROM ${VEC_TABLE}
@@ -4592,40 +4594,39 @@ function knnVecScanner(db: Database, partitioned: boolean, restricted: boolean):
   `);
   return (embedding, k, target) => {
     const params: SQLiteValue[] = [embedding, k];
-    if (partitioned) params.push(vecInteger(target.collectionId ?? 0));
-    if (restricted) params.push(rowidList(target.eligibleRowids ?? []));
+    const partition = vecInteger(target.collectionId ?? 0);
+    if (partitioned) params.push(partition);
+    if (eligible) {
+      params.push(...eligible.params);
+      if (partitioned) params.push(partition);
+    }
     return statement.all(...params) as VecMatch[];
   };
 }
 
 /**
- * Vector rows of active documents a metadata filter admits, keyed by
- * collection id. A row is eligible when any document of its collection that
- * holds the row's content passes the filter.
+ * FROM and WHERE clauses selecting, as `vr`, the vector rows of active
+ * documents a metadata filter admits. A row is eligible when any document of
+ * its collection that holds the row's content passes the filter.
  */
-function metadataEligibleVectorRows(db: Database, filter: MetadataFilter, collectionIds?: readonly number[]): Map<number, number[]> {
+function metadataEligibleRowsSql(filter: MetadataFilter): { sql: string; params: SQLiteValue[] } {
   const current = compileCurrentMetadataFilter(filter);
-  const params: SQLiteValue[] = [...current.params];
-  let scope = "";
-  if (collectionIds) {
-    scope = ` AND vr.collection_id IN (SELECT value FROM json_each(?))`;
-    params.push(JSON.stringify(collectionIds));
-  }
-  const rows = db.prepare(`
-    SELECT DISTINCT vr.id AS rowid, vr.collection_id AS collectionId
-    FROM documents d
-    JOIN document_metadata dm ON dm.document_id = d.id
-    JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.name = d.collection
-    JOIN ${VEC_ROWS_TABLE} vr ON vr.hash = d.hash AND vr.collection_id = ci.id
-    WHERE d.active = 1 AND ${current.sql}${scope}
-  `).all(...params) as { rowid: number; collectionId: number }[];
-  const byCollection = new Map<number, number[]>();
-  for (const row of rows) {
-    const list = byCollection.get(row.collectionId);
-    if (list) list.push(row.rowid);
-    else byCollection.set(row.collectionId, [row.rowid]);
-  }
-  return byCollection;
+  return {
+    sql: `
+      FROM documents d
+      JOIN document_metadata dm ON dm.document_id = d.id
+      JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.name = d.collection
+      JOIN ${VEC_ROWS_TABLE} vr ON vr.hash = d.hash AND vr.collection_id = ci.id
+      WHERE d.active = 1 AND ${current.sql}`,
+    params: current.params,
+  };
+}
+
+/** Ids of the collections holding at least one vector row a metadata filter admits. */
+function metadataEligibleCollections(db: Database, filter: MetadataFilter): Set<number> {
+  const eligible = metadataEligibleRowsSql(filter);
+  const rows = db.prepare(`SELECT DISTINCT vr.collection_id AS collectionId ${eligible.sql}`).all(...eligible.params) as { collectionId: number }[];
+  return new Set(rows.map(row => row.collectionId));
 }
 
 /**
@@ -4705,7 +4706,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
     collectionIds = Array.from(resolveCollectionIds(db, names).values());
     if (collectionIds.length === 0) return [];
   }
-  const eligible = filter ? metadataEligibleVectorRows(db, filter, collectionIds) : undefined;
+  const eligible = filter ? metadataEligibleCollections(db, filter) : undefined;
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
@@ -4717,12 +4718,10 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // member rather than `collection_id IN (...)`: the IN form yields k rows per
   // value only because SQLite runs vec0's filter once per value, which is a
   // planner detail rather than a vec0 contract.
-  const targets: VecScanTarget[] = collectionIds
-    ? collectionIds.map(collectionId => ({ collectionId, eligibleRowids: eligible?.get(collectionId) }))
-    : [{ eligibleRowids: eligible && Array.from(eligible.values()).flat() }];
-  const scanTargets = eligible ? targets.filter(t => t.eligibleRowids?.length) : targets;
+  const scanned = collectionIds && eligible ? collectionIds.filter(id => eligible.has(id)) : collectionIds;
+  const scanTargets: VecScanTarget[] = scanned ? scanned.map(collectionId => ({ collectionId })) : eligible?.size === 0 ? [] : [{}];
   if (scanTargets.length === 0) return [];
-  const scan = knnVecScanner(db, collectionIds !== undefined, eligible !== undefined);
+  const scan = knnVecScanner(db, collectionIds !== undefined, filter);
   const resolve = vecDocumentResolver(db, filter);
   const queryVec = new Float32Array(embedding);
   // Bodies are capped at 256 KiB, as in searchFTS, so a large document cannot
