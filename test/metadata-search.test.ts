@@ -23,6 +23,7 @@ import {
 import { replaceDocumentMetadata, syncDocumentMetadata } from "../src/metadata-store.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "../src/metadata.js";
 import type { MetadataFilter } from "../src/metadata-filter.js";
+import type { Database, SQLiteValue } from "../src/db.js";
 
 let testDir: string;
 let store: Store;
@@ -303,6 +304,47 @@ describe("searchVec with metadata filter", () => {
     expect(filtered).toHaveLength(5);
     expect(filtered.every(r => r.metadata.eligible === true)).toBe(true);
   }, 120_000);
+
+  test("a filtered vector scan binds no list of eligible rows, so none is held on the heap", async () => {
+    store.ensureVecTable(3);
+    // One eligible document of 2,000 chunks, and closer ineligible documents.
+    const { hash } = await insertDoc("book", "long-eligible.md", "# Long eligible", { eligible: true });
+    const now = new Date().toISOString();
+    store.db.transaction(() => {
+      for (let seq = 0; seq < 2_000; seq++) insertEmbedding(store.db, hash, seq, seq, new Float32Array([0, 1, 0]), model, now, 2_000);
+    })();
+    for (let i = 0; i < 50; i++) {
+      await insertEmbeddedDoc("book", `closer-${i}.md`, `# Closer ${i}`, [1, 0, 0], { eligible: false });
+    }
+    // Every string bound to a vector scan: a JSON list of eligible rowids would show here.
+    const bound: string[] = [];
+    const recording: Database = {
+      prepare: (sql: string) => {
+        const real = store.db.prepare(sql);
+        if (!sql.includes("MATCH")) return real;
+        return {
+          ...real,
+          run: real.run.bind(real),
+          get: real.get.bind(real),
+          iterate: real.iterate.bind(real),
+          all: (...params: SQLiteValue[]) => {
+            for (const param of params) if (typeof param === "string" && param.startsWith("[")) bound.push(param);
+            return real.all(...params);
+          },
+        };
+      },
+      transaction: (fn) => store.db.transaction(fn),
+      exec: (sql: string) => store.db.exec(sql),
+      loadExtension: (path: string) => store.db.loadExtension(path),
+      close: () => store.db.close(),
+    };
+
+    for (const scope of ["book", undefined]) {
+      const results = await searchVec(recording, "q", model, 5, scope, undefined, queryEmbedding, undefined, eligibleOnly);
+      expect(results.map(r => r.displayPath)).toEqual(["book/long-eligible.md"]);
+    }
+    expect(bound).toEqual([]);
+  });
 
   test("shared content hash within one collection returns only the matching document path", async () => {
     store.ensureVecTable(3);
