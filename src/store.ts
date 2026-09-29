@@ -4340,9 +4340,15 @@ function mergeSearchResultsByScore(lists: SearchResult[][], limit: number): Sear
       if (!prev || r.score > prev.score) best.set(r.filepath, r);
     }
   }
+  // Ties go to the smaller filepath, so the order the collections were named
+  // never decides which of two equal hits survives the limit.
   return Array.from(best.values())
-    .sort((a, b) => b.score - a.score)
+    .sort((a, b) => b.score - a.score || compareFilepaths(a, b))
     .slice(0, limit);
+}
+
+function compareFilepaths(a: { filepath: string }, b: { filepath: string }): number {
+  return a.filepath < b.filepath ? -1 : a.filepath > b.filepath ? 1 : 0;
 }
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
