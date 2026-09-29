@@ -109,4 +109,15 @@ describe("doctor vector sampling", () => {
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({ samples: 3, distinctChunks: 3, bodiesComplete: true });
   });
+
+  test("the doctor check verifies large documents with duplicate paths within a 32 MiB SQLite budget", () => {
+    // SQLite's hard heap limit is process-wide and cannot be raised again.
+    const worker = join(projectRoot, "test", "_helpers", "doctor-vector-check-worker.ts");
+    const args = isBun ? [worker] : [join(projectRoot, "node_modules", "tsx", "dist", "cli.mjs"), worker];
+    const result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ ok: true, details: "3 sampled chunks reproduce stored vectors" });
+  });
 });
