@@ -3147,6 +3147,69 @@ describe("Reindex Collection file sync state (#962)", () => {
     }
   });
 
+  test("removing a collection and adding it back re-indexes its files", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-readd");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      removeCollection(store.db, "notes");
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.indexed).toBe(1);
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("removing and re-adding a collection re-indexes a file whose mtime moved but content did not", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-readd-touched");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      removeCollection(store.db, "notes");
+      await utimes(file, new Date("2026-01-02T03:05:05Z"), new Date("2026-01-02T03:05:05Z"));
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.indexed).toBe(1);
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("renaming a collection and adding the old name at another path indexes both", async () => {
+    const store = await createTestStore();
+    const first = await collectionDir("sync-rename-first");
+    const second = await collectionDir("sync-rename-second");
+    const mtime = new Date("2026-01-02T03:04:05Z");
+    try {
+      // Same relative path, size and mtime in both directories.
+      await writeFile(join(first, "doc.md"), "# A\n\nalpha\n");
+      await writeFile(join(second, "doc.md"), "# A\n\nbravo\n");
+      await utimes(join(first, "doc.md"), mtime, mtime);
+      await utimes(join(second, "doc.md"), mtime, mtime);
+      await reindexCollection(store, first, "**/*.md", "notes");
+      renameCollection(store.db, "notes", "archive");
+
+      await reindexCollection(store, first, "**/*.md", "archive");
+      const result = await reindexCollection(store, second, "**/*.md", "notes");
+      expect(result.indexed).toBe(1);
+      expect(activeBody(store, "archive", "doc.md")).toContain("alpha");
+      expect(activeBody(store, "notes", "doc.md")).toContain("bravo");
+    } finally {
+      await rm(first, { recursive: true, force: true });
+      await rm(second, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
   test("searchFTS returns at most 256 KiB of a document body", async () => {
     const store = await createTestStore();
     try {
