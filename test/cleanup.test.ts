@@ -309,4 +309,44 @@ describe("qmd cleanup vector repack", () => {
     expect(partitionCount(s, "alpha")).toBe(4);
     expect(partitionCount(s, "beta")).toBe(4);
   });
+
+  test("a failed move of a chunk's last row rolls back the emptied chunk", async () => {
+    const s = await openStore();
+    // The first chunk keeps one row, so moving it empties the chunk inside the transaction.
+    await seedVectors(s, 1100, [0, 1099]);
+    const failing: Database = {
+      prepare: (sql: string) => {
+        const real = s.db.prepare(sql);
+        if (!sql.startsWith(`INSERT INTO ${VEC_TABLE} (`)) return real;
+        return { ...real, get: real.get.bind(real), all: real.all.bind(real), iterate: real.iterate.bind(real), run: () => { throw new Error("injected failure during re-insert"); } };
+      },
+      transaction: (fn) => s.db.transaction(fn),
+      exec: (sql: string) => s.db.exec(sql),
+      loadExtension: (path: string) => s.db.loadExtension(path),
+      close: () => s.db.close(),
+    };
+
+    expect(() => repackVectors(failing)).toThrow("injected failure during re-insert");
+    expect(vectorTableLayout(s.db)).toEqual({ rows: 2, chunks: 2, neededChunks: 1, occupancy: 0.5 });
+    expect(liveHashes(s)).toEqual(["vec00000", "vec01099"]);
+    expect(nearest(s)).toBe("vec00000");
+  });
+
+  test("previewCleanup counts a shared hash's row as orphaned only in the collection that dropped it", async () => {
+    const s = await openStore();
+    const now = new Date().toISOString();
+    s.ensureVecTable(DIMS);
+    insertContent(s.db, "sharedhash", "body sharedhash", now);
+    insertDocument(s.db, "alpha", "shared.md", "shared", "sharedhash", now, now);
+    insertDocument(s.db, "beta", "shared.md", "shared", "sharedhash", now, now);
+    s.insertEmbedding("sharedhash", 0, 0, new Float32Array([1, 0, 0]), "test-model", now, 1);
+    expect(partitionCount(s, "alpha")).toBe(1);
+    expect(partitionCount(s, "beta")).toBe(1);
+    deactivateDocument(s.db, "beta", "shared.md");
+
+    expect(previewCleanup(s.db).vectorLayout).toMatchObject({ rows: 1, chunks: 1 });
+    runCleanup(s.db);
+    expect(partitionCount(s, "alpha")).toBe(1);
+    expect(partitionCount(s, "beta")).toBe(0);
+  });
 });
