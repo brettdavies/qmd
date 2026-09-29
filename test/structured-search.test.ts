@@ -661,6 +661,33 @@ describe("structuredSearch collection scope", () => {
     expect(searchVec.mock.calls[0]![3]).toEqual(["alpha", "beta"]);
   });
 
+  test("a vec leg ranks the same whichever order the collections are named in", async () => {
+    const embedModel = "scope-embed-model";
+    store.ensureVecTable(3);
+    store.llm = {
+      embedModelName: embedModel,
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [1, 0, 0], model: embedModel })),
+    } as any;
+    const now = new Date().toISOString();
+    const vectors: [string, string, number[]][] = [
+      ["alpha", "far.md", [0, 1, 0]],
+      ["beta", "near.md", [1, 0, 0]],
+      ["alpha", "mid.md", [0.8, 0.6, 0]],
+    ];
+    for (const [collection, path, vector] of vectors) {
+      addDocument(collection, path, `# ${path}\n\nbody`);
+      store.insertEmbedding(`hash-${collection}-${path}`, 0, 0, new Float32Array(vector), embedModel, now);
+    }
+
+    const searches: ExpandedQuery[] = [{ type: "vec", query: "x" }];
+    const unscoped = await structuredSearch(store, searches, { skipRerank: true });
+    expect(unscoped.map(r => r.displayPath)).toEqual(["beta/near.md", "alpha/mid.md", "alpha/far.md"]);
+    for (const collections of [["alpha", "beta"], ["beta", "alpha"]]) {
+      const scoped = await structuredSearch(store, searches, { collections, skipRerank: true });
+      expect(scoped.map(r => r.displayPath)).toEqual(unscoped.map(r => r.displayPath));
+    }
+  });
+
   test("an empty collection list searches every collection", async () => {
     addDocument("alpha", "a.md", "# A\n\nquokkascope in alpha");
     addDocument("beta", "b.md", "# B\n\nquokkascope in beta");
