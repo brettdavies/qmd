@@ -4725,7 +4725,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const scan = knnVecScanner(db, collectionIds !== undefined, eligible !== undefined);
   const resolve = vecDocumentResolver(db, filter);
   const queryVec = new Float32Array(embedding);
-  const bodyOf = db.prepare(`SELECT doc FROM content WHERE hash = ?`);
+  // Bodies are capped at 256 KiB, as in searchFTS, so a large document cannot
+  // put its whole text on the heap for each result.
+  const bodyOf = db.prepare(`SELECT substr(doc, 1, 262144) AS doc FROM content WHERE hash = ?`);
 
   // Each target yields its own nearest `limit` documents (or all it holds), so
   // merging them by distance gives the scope's exact nearest `limit`.
