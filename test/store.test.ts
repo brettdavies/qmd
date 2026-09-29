@@ -1445,6 +1445,57 @@ describe("Query expansion cache (#818)", () => {
       await cleanupTestDb(store);
     }
   });
+
+  test("vectorSearchQuery searches each distinct expansion once from a cached row in the older text shape", async () => {
+    const store = await createTestStore();
+    const embedModel = "dedupe-embed-model";
+    store.ensureVecTable(3);
+    store.llm = { embedModelName: embedModel } as any;
+    const searchVecSpy = vi.fn(async () => [] as SearchResult[]);
+    store.searchVec = searchVecSpy as any;
+    try {
+      // Rows written before the cache stored `query` carry the line as `text`.
+      const cached = [
+        ...Array.from({ length: 12 }, () => ({ type: "hyde", text: "g" })),
+        { type: "vec", text: "v" },
+        { type: "vec", text: "v" },
+      ];
+      store.setCachedResult(getCacheKey("expandQuery", { query: "q", model: DEFAULT_QUERY_MODEL }), JSON.stringify(cached));
+
+      await vectorSearchQuery(store, "q", { limit: 5 });
+
+      expect(searchVecSpy.mock.calls.map(call => call[0])).toEqual(["q", "g", "v"]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("hybridQuery runs one keyword search per distinct cached lex line", async () => {
+    const store = await createTestStore();
+    const embedModel = "dedupe-embed-model";
+    store.ensureVecTable(3);
+    store.llm = {
+      embedModelName: embedModel,
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [1, 2, 3], model: embedModel })),
+    } as any;
+    store.searchVec = vi.fn(async () => [] as SearchResult[]) as any;
+    const searchFTSSpy = vi.fn(() => [] as SearchResult[]);
+    store.searchFTS = searchFTSSpy as any;
+    try {
+      const cached = [
+        { type: "lex", query: "k" }, { type: "lex", query: "k" }, { type: "lex", query: "k" },
+        { type: "vec", query: "v" },
+      ];
+      store.setCachedResult(getCacheKey("expandQuery", { query: "q", model: DEFAULT_QUERY_MODEL }), JSON.stringify(cached));
+
+      await hybridQuery(store, "q", { limit: 5, minScore: 0, skipRerank: true, intent: "x" });
+
+      // The original query's probe, then the distinct lex line once.
+      expect(searchFTSSpy.mock.calls.map(call => call[0])).toEqual(["q", "k"]);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 
