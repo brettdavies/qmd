@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStore, maybeAdoptLegacyEmbeddingFingerprint } from "../../src/store.ts";
+import { heapLimitBinds } from "./heap-limit.ts";
 
 const model = "model";
 const dir = mkdtempSync(join(tmpdir(), "qmd-legacy-shared-body-"));
@@ -36,7 +37,7 @@ try {
   store.db.exec("PRAGMA temp_store = MEMORY");
   store.db.exec("PRAGMA hard_heap_limit = 16777216");
   const result = await maybeAdoptLegacyEmbeddingFingerprint(store, model);
-  console.log(JSON.stringify({ checked: result.checked, adopted: result.adopted }));
+  console.log(JSON.stringify({ checked: result.checked, adopted: result.adopted, limitBinds: heapLimitBinds(store.db, 16777216) }));
 } finally {
   store.close();
   rmSync(dir, { recursive: true, force: true });

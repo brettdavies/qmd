@@ -1,6 +1,7 @@
 import { createStore } from "../../src/store.js";
 import { checkEmbeddingVectorSamples } from "../../src/cli/qmd.js";
 import { LlamaCpp, setDefaultLlamaCpp } from "../../src/llm.js";
+import { heapLimitBinds } from "./heap-limit.js";
 
 // Every stored vector is [1, 0] and every re-embedded chunk returns [1, 0], so
 // the check passes whenever it can sample, read and chunk the bodies.
@@ -29,7 +30,7 @@ try {
   store.db.exec("PRAGMA temp_store = MEMORY");
   store.db.exec("PRAGMA hard_heap_limit = 33554432");
   const result = await checkEmbeddingVectorSamples(store.db, "model", "current");
-  console.log(JSON.stringify(result));
+  console.log(JSON.stringify({ ...result, limitBinds: heapLimitBinds(store.db, 33554432) }));
 } finally {
   setDefaultLlamaCpp(null);
   store.close();

@@ -118,6 +118,9 @@ describe("doctor vector sampling", () => {
     expect(result.error).toBeUndefined();
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ ok: true, details: "3 sampled chunks reproduce stored vectors" });
+    const out = JSON.parse(result.stdout);
+    expect(out).toMatchObject({ ok: true, details: "3 sampled chunks reproduce stored vectors" });
+    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
+    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
   });
 });

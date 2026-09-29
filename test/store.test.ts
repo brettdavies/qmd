@@ -4350,7 +4350,10 @@ describe("Embedding batching", () => {
     expect(result.error).toBeUndefined();
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ checked: true, adopted: 1 });
+    const out = JSON.parse(result.stdout);
+    expect(out).toMatchObject({ checked: true, adopted: 1 });
+    // The budget only binds where SQLite tracks memory; on Bun under Linux it must.
+    if (isBun && process.platform === "linux") expect(out.limitBinds).toBe(true);
   });
 
   test("generateEmbeddings flushes batches when maxDocsPerBatch is reached", async () => {
