@@ -5,7 +5,7 @@
  * Uses mocked Ollama responses and a test database.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
 import { getDefaultLlamaCpp, disposeDefaultLlamaCpp } from "../src/llm";
@@ -1428,6 +1428,92 @@ describe("MCP HTTP Transport — 2026-07-28 protocol", () => {
     const res = await fetch(`${baseUrl}/mcp`, { method: "GET" });
     expect(res.status).toBe(405);
     expect(res.headers.get("mcp-session-id")).toBeNull();
+  });
+
+  // Each request gets a fresh McpServer, so these observe the per-store
+  // instructions cache through server/discover.
+  async function discoverInstructions(id: number): Promise<{ status: number; instructions?: string }> {
+    const { status, json } = await postMcp(
+      { jsonrpc: "2.0", id, method: "server/discover", params: { _meta: mcp2026Meta } },
+      { "MCP-Protocol-Version": MCP_2026, "Mcp-Method": "server/discover" },
+    );
+    return { status, instructions: json.result?.instructions };
+  }
+
+  function documentCount(instructions: string | undefined): number {
+    const match = instructions?.match(/over (\d+) markdown documents/);
+    if (!match) throw new Error(`no document count in instructions: ${instructions}`);
+    return Number(match[1]);
+  }
+
+  function activeDocuments(): number {
+    const db = openDatabase(dbPath);
+    try {
+      const row = db.prepare(`SELECT COUNT(*) AS n FROM documents WHERE active = 1`).get() as { n: number };
+      return row.n;
+    } finally {
+      db.close();
+    }
+  }
+
+  function addDocument(slug: string): void {
+    const db = openDatabase(dbPath);
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO content (hash, doc, created_at) VALUES (?, ?, ?)`)
+      .run(`hash-${slug}`, `# ${slug}\nbody`, now);
+    db.prepare(`INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES ('docs', ?, ?, ?, ?, ?, 1)`)
+      .run(`${slug}.md`, slug, `hash-${slug}`, now, now);
+    db.close();
+  }
+
+  test("server/discover serves cached instructions after the index changes", async () => {
+    const first = await discoverInstructions(20);
+    expect(first.status).toBe(200);
+    addDocument("instructions-cache-hit");
+    const second = await discoverInstructions(21);
+    expect(second.status).toBe(200);
+    expect(second.instructions).toBe(first.instructions);
+  });
+
+  test("server/discover rebuilds instructions once the 60 s cache entry expires", async () => {
+    const realNow = Date.now.bind(Date);
+    const first = await discoverInstructions(22);
+    addDocument("instructions-cache-expiry");
+    const cached = await discoverInstructions(23);
+    expect(cached.instructions).toBe(first.instructions);
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 61_000);
+    try {
+      const rebuilt = await discoverInstructions(24);
+      expect(rebuilt.status).toBe(200);
+      expect(documentCount(rebuilt.instructions)).toBe(activeDocuments());
+      expect(documentCount(rebuilt.instructions)).toBeGreaterThan(documentCount(first.instructions));
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test("server/discover retries a failed instructions build instead of caching the failure", async () => {
+    const realNow = Date.now.bind(Date);
+    // Past every earlier entry's TTL, so the next discover has to build.
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + 10 * 60_000);
+    const db = openDatabase(dbPath);
+    try {
+      db.exec(`ALTER TABLE store_collections RENAME TO store_collections_offline`);
+      const failed = await discoverInstructions(25);
+      expect(failed.instructions).toBeUndefined();
+      db.exec(`ALTER TABLE store_collections_offline RENAME TO store_collections`);
+
+      const retried = await discoverInstructions(26);
+      expect(retried.status).toBe(200);
+      addDocument("instructions-cache-after-failure");
+      const cached = await discoverInstructions(27);
+      expect(cached.instructions).toBe(retried.instructions);
+    } finally {
+      const offline = db.prepare(`SELECT name FROM sqlite_master WHERE name = 'store_collections_offline'`).get();
+      if (offline) db.exec(`ALTER TABLE store_collections_offline RENAME TO store_collections`);
+      db.close();
+      clock.mockRestore();
+    }
   });
 });
 
