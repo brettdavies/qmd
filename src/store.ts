@@ -3191,6 +3191,9 @@ interface VecChunkRow {
   rowids: Uint8Array;
 }
 
+/** A plan for repackVectors: the table's chunk layout and the chunks it would move. */
+type VecRepackPlan = { layout: VectorTableLayout; sparse: number[] };
+
 /** The partitioned vec0 table when sqlite-vec is loaded and the table answers; null otherwise. */
 function readableVectorLayout(db: Database): Extract<VecLayout, { kind: "partitioned" }> | null {
   if (!isSqliteVecAvailable()) return null;
@@ -3199,34 +3202,64 @@ function readableVectorLayout(db: Database): Extract<VecLayout, { kind: "partiti
 }
 
 /**
- * Chunk layout of the vector table from vec0's shadow tables, or null without
- * a readable table. `droppedRows` projects the layout after that many rows are
- * deleted without their chunks going away, which is what orphan removal does.
+ * Chunk layout of the vector table from vec0's shadow tables, and the chunks
+ * a repack would move: those filled below VEC_REPACK_CHUNK_FILL, except each
+ * partition's newest. Rows of different partitions never share a chunk, so a
+ * packed table needs ceil(rows / chunk size) chunks in each partition. With
+ * `dropOrphans` the plan is for the table as cleanupOrphanedVectors will
+ * leave it; vec0 drops a chunk with its last row, so a chunk holding only
+ * orphans is gone from that layout.
  */
-export function vectorTableLayout(db: Database, droppedRows: number = 0): VectorTableLayout | null {
+function vectorRepackPlan(db: Database, dropOrphans: boolean = false): VecRepackPlan | null {
   const layout = readableVectorLayout(db);
   if (!layout) return null;
-  const chunkRow = db.prepare(`SELECT COUNT(*) AS chunks, MAX(size) AS chunkSize FROM ${layout.shadow.chunks}`).get() as { chunks: number; chunkSize: number | null };
-  const stored = (db.prepare(`SELECT COUNT(*) AS c FROM ${layout.shadow.rowids}`).get() as { c: number }).c;
-  const rows = Math.max(stored - droppedRows, 0);
-  const chunkSize = chunkRow.chunkSize ?? 0;
-  const neededChunks = chunkSize > 0 ? Math.ceil(rows / chunkSize) : 0;
-  const occupancy = chunkRow.chunks > 0 ? neededChunks / chunkRow.chunks : 1;
-  return { rows, chunks: chunkRow.chunks, neededChunks, occupancy };
+  const orphansByChunk = new Map<number, number>();
+  if (dropOrphans) {
+    const rows = db.prepare(`
+      SELECT r.chunk_id AS chunkId, COUNT(*) AS n
+      FROM ${VEC_ROWS_TABLE} vr
+      JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
+      JOIN ${layout.shadow.rowids} r ON r.rowid = vr.id
+      WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = vr.hash AND d.collection = ci.name AND d.active = 1)
+      GROUP BY r.chunk_id
+    `).all() as { chunkId: number; n: number }[];
+    for (const row of rows) orphansByChunk.set(row.chunkId, row.n);
+  }
+  const chunks = (db.prepare(`SELECT chunk_id AS chunkId, size, partition00 AS partition, validity FROM ${layout.shadow.chunks} ORDER BY chunk_id`).all() as Omit<VecChunkRow, "rowids">[])
+    .map((chunk) => ({ ...chunk, live: liveSlots(chunk).length - (orphansByChunk.get(chunk.chunkId) ?? 0) }))
+    .filter((chunk) => chunk.live > 0);
+  const rowsByPartition = new Map<number, number>();
+  const newestByPartition = new Map<number, number>();
+  for (const chunk of chunks) {
+    rowsByPartition.set(chunk.partition, (rowsByPartition.get(chunk.partition) ?? 0) + chunk.live);
+    newestByPartition.set(chunk.partition, chunk.chunkId);
+  }
+  let rows = 0;
+  let neededChunks = 0;
+  for (const chunk of chunks) {
+    if (newestByPartition.get(chunk.partition) !== chunk.chunkId) continue;
+    const partitionRows = rowsByPartition.get(chunk.partition)!;
+    rows += partitionRows;
+    neededChunks += Math.ceil(partitionRows / chunk.size);
+  }
+  const occupancy = chunks.length > 0 ? neededChunks / chunks.length : 1;
+  const sparse = chunks
+    .filter((chunk) => newestByPartition.get(chunk.partition) !== chunk.chunkId && chunk.live < chunk.size * VEC_REPACK_CHUNK_FILL)
+    .map((chunk) => chunk.chunkId);
+  return { layout: { rows, chunks: chunks.length, neededChunks, occupancy }, sparse };
 }
 
-/** Vector rows cleanupOrphanedVectors would delete: partition rows whose (hash, collection) has no active document. */
-function countOrphanedVectorRows(db: Database): number {
-  if (!readableVectorLayout(db)) return 0;
-  return (db.prepare(`
-    SELECT COUNT(*) AS c
-    FROM ${VEC_ROWS_TABLE} vr
-    JOIN ${VEC_COLLECTION_IDS_TABLE} ci ON ci.id = vr.collection_id
-    WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = vr.hash AND d.collection = ci.name AND d.active = 1)
-  `).get() as { c: number }).c;
+/** Whether a plan is worth running: the table's scans read mostly holes and some chunk would move. */
+function repackWanted(plan: VecRepackPlan | null): plan is VecRepackPlan {
+  return plan !== null && plan.layout.occupancy < VEC_REPACK_BELOW_OCCUPANCY && plan.sparse.length > 0;
 }
 
-function liveSlots(chunk: VecChunkRow): number[] {
+/** Chunk layout of the vector table from vec0's shadow tables, or null without a readable table. */
+export function vectorTableLayout(db: Database): VectorTableLayout | null {
+  return vectorRepackPlan(db)?.layout ?? null;
+}
+
+function liveSlots(chunk: { size: number; validity: Uint8Array }): number[] {
   const slots: number[] = [];
   for (let i = 0; i < chunk.size; i++) {
     if ((chunk.validity[i >> 3]! >> (i & 7)) & 1) slots.push(i);
@@ -3247,17 +3280,23 @@ function liveSlots(chunk: VecChunkRow): number[] {
  */
 export function repackVectors(db: Database, onChunk?: (moved: number, total: number) => void): VectorTableLayout | null {
   const layout = readableVectorLayout(db);
-  if (!layout) return null;
-  const chunks = db.prepare(`SELECT chunk_id AS chunkId, size, partition00 AS partition, validity, rowids FROM ${layout.shadow.chunks} ORDER BY chunk_id`).all() as VecChunkRow[];
-  const newestByPartition = new Map<number, number>();
-  for (const chunk of chunks) newestByPartition.set(chunk.partition, chunk.chunkId);
-  const sparse = chunks.filter((c) => newestByPartition.get(c.partition) !== c.chunkId && liveSlots(c).length < c.size * VEC_REPACK_CHUNK_FILL);
+  const plan = vectorRepackPlan(db);
+  if (!layout || !plan) return null;
+  const chunkOf = db.prepare(`SELECT chunk_id AS chunkId, size, partition00 AS partition, validity, rowids FROM ${layout.shadow.chunks} WHERE chunk_id = ?`);
+  const newestOf = db.prepare(`SELECT MAX(chunk_id) AS chunkId FROM ${layout.shadow.chunks} WHERE partition00 = ?`);
   const vectorOf = db.prepare(`SELECT embedding FROM ${layout.table} WHERE rowid = ?`);
   const remove = db.prepare(`DELETE FROM ${layout.table} WHERE rowid = ?`);
   const insert = db.prepare(`INSERT INTO ${layout.table} (rowid, collection_id, embedding) VALUES (?, ?, ?)`);
-  sparse.forEach((chunk, i) => {
-    const rowids = new DataView(chunk.rowids.buffer, chunk.rowids.byteOffset, chunk.rowids.byteLength);
+  plan.sparse.forEach((chunkId, i) => {
     db.transaction(() => {
+      // Read the chunk again under the write lock: since the plan was made, a
+      // concurrent embed or update may have emptied it, made it its
+      // partition's newest, or deleted a row whose rowid now belongs to
+      // another partition.
+      const chunk = chunkOf.get(chunkId) as VecChunkRow | undefined;
+      if (!chunk) return;
+      if ((newestOf.get(chunk.partition) as { chunkId: number }).chunkId === chunkId) return;
+      const rowids = new DataView(chunk.rowids.buffer, chunk.rowids.byteOffset, chunk.rowids.byteLength);
       for (const slot of liveSlots(chunk)) {
         const rowid = rowids.getBigInt64(slot * 8, true);
         const row = vectorOf.get(rowid) as { embedding: Uint8Array } | undefined;
@@ -3266,7 +3305,7 @@ export function repackVectors(db: Database, onChunk?: (moved: number, total: num
         insert.run(rowid, vecInteger(chunk.partition), row.embedding);
       }
     }).immediate();
-    onChunk?.(i + 1, sparse.length);
+    onChunk?.(i + 1, plan.sparse.length);
   });
   return vectorTableLayout(db);
 }
@@ -3310,9 +3349,8 @@ export function previewCleanup(db: Database): CleanupStats {
   const orphanedVectors = countOrphanedVectors(db);
   const inactiveDocs = (db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 0`).get() as { c: number }).c;
   const orphanedContent = countOrphanedContent(db);
-  const vectorLayout = vectorTableLayout(db, countOrphanedVectorRows(db));
-  const vectorsRepacked = vectorLayout !== null && vectorLayout.occupancy < VEC_REPACK_BELOW_OCCUPANCY;
-  return { cacheCount, orphanedVectors, inactiveDocs, orphanedContent, vectorLayout, vectorsRepacked };
+  const plan = vectorRepackPlan(db, true);
+  return { cacheCount, orphanedVectors, inactiveDocs, orphanedContent, vectorLayout: plan?.layout ?? null, vectorsRepacked: repackWanted(plan) };
 }
 
 export type CleanupHooks = {
@@ -3328,17 +3366,17 @@ export type CleanupHooks = {
 export function runCleanup(db: Database, hooks: CleanupHooks = {}): CleanupStats {
   const cacheCount = deleteLLMCache(db);
   const orphanedVectors = cleanupOrphanedVectors(db);
-  const vectorLayout = vectorTableLayout(db);
-  const vectorsRepacked = vectorLayout !== null && vectorLayout.occupancy < VEC_REPACK_BELOW_OCCUPANCY;
-  if (vectorsRepacked && vectorLayout) {
-    hooks.onVectorRepack?.(vectorLayout);
+  const plan = vectorRepackPlan(db);
+  const vectorsRepacked = repackWanted(plan);
+  if (vectorsRepacked) {
+    hooks.onVectorRepack?.(plan.layout);
     repackVectors(db);
   }
   const inactiveDocs = deleteInactiveDocuments(db);
   const orphanedContent = cleanupOrphanedContent(db);
   optimizeDocumentsFts(db);
   vacuumDatabase(db);
-  return { cacheCount, orphanedVectors, inactiveDocs, orphanedContent, vectorLayout, vectorsRepacked };
+  return { cacheCount, orphanedVectors, inactiveDocs, orphanedContent, vectorLayout: plan?.layout ?? null, vectorsRepacked };
 }
 
 // =============================================================================
