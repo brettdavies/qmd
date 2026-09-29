@@ -3110,6 +3110,25 @@ describe("Reindex Collection file sync state (#962)", () => {
     }
   });
 
+  test("a previously indexed file that grows past 10 MB is reported and deactivated", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-grown");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      await writeFile(file, "# A\n\n" + "a".repeat(10 * 1024 * 1024));
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.skippedFiles).toEqual([{ file: "doc.md", code: "FILE_TOO_LARGE" }]);
+      expect(activeBody(store, "notes", "doc.md")).toBeUndefined();
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
   test("a previously indexed file that becomes empty is deactivated", async () => {
     const store = await createTestStore();
     const dir = await collectionDir("sync-emptied");
