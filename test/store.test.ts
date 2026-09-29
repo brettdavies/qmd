@@ -3233,6 +3233,46 @@ describe("Reindex Collection file sync state (#962)", () => {
     }
   });
 
+  test("removing a collection deletes its sync rows", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-remove-rows");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(1);
+
+      removeCollection(store.db, "notes");
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("renaming a collection moves its sync rows, so the new name keeps the fast path", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-rename-rows");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      renameCollection(store.db, "notes", "archive");
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(0);
+      expect(syncRowCount(store, "archive", "doc.md")).toBe(1);
+
+      // A read would now report EACCES.
+      await chmod(file, 0o000);
+      const result = await reindexCollection(store, dir, "**/*.md", "archive");
+      expect(result.skippedFiles).toEqual([]);
+      expect(result).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+    } finally {
+      await chmod(file, 0o644);
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
   test("renaming a collection and adding the old name at another path indexes both", async () => {
     const store = await createTestStore();
     const first = await collectionDir("sync-rename-first");
