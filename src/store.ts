@@ -1639,9 +1639,20 @@ type FileSyncStateRow = {
 
 function getFileSyncStateMap(db: Database, collectionName: string): Map<string, FileSyncStateRow> {
   try {
-    const stmt = db.prepare(
-      `SELECT relative_path, mtime_ms, size, content_hash, document_id FROM file_sync_state WHERE collection = ?`
-    );
+    // A row is trusted only while its document is still the active row for
+    // this collection, path and content. Removing a collection, or renaming it
+    // away, leaves rows behind; trusting those would count a file that has no
+    // active document as unchanged. A distrusted row is rewritten on reindex.
+    const stmt = db.prepare(`
+      SELECT s.relative_path, s.mtime_ms, s.size, s.content_hash, s.document_id
+      FROM file_sync_state s
+      JOIN documents d ON d.id = s.document_id
+      WHERE s.collection = ?
+        AND d.active = 1
+        AND d.collection = s.collection
+        AND d.path = s.relative_path
+        AND d.hash = s.content_hash
+    `);
     const map = new Map<string, FileSyncStateRow>();
     // Large-result query: use iterate() to stream rows instead of .all() materializing at once
     for (const r of stmt.iterate(collectionName) as IterableIterator<FileSyncStateRow>) {
