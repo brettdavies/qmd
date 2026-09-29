@@ -42,7 +42,6 @@ import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js
 import {
   initializeMetadataSchema,
   syncDocumentMetadata,
-  isDocumentMetadataCurrent,
   countDocumentsPendingMetadata,
   getMetadataByFilepath,
   parseMetadataJson,
@@ -1636,6 +1635,8 @@ type FileSyncStateRow = {
   size: number;
   content_hash: string;
   document_id: number;
+  /** 1 when the document has a metadata extraction at the current version. */
+  metadata_current: number;
 };
 
 function getFileSyncStateMap(db: Database, collectionName: string): Map<string, FileSyncStateRow> {
@@ -1645,9 +1646,11 @@ function getFileSyncStateMap(db: Database, collectionName: string): Map<string, 
     // away, leaves rows behind; trusting those would count a file that has no
     // active document as unchanged. A distrusted row is rewritten on reindex.
     const stmt = db.prepare(`
-      SELECT s.relative_path, s.mtime_ms, s.size, s.content_hash, s.document_id
+      SELECT s.relative_path, s.mtime_ms, s.size, s.content_hash, s.document_id,
+        COALESCE(dm.extraction_version = ?, 0) AS metadata_current
       FROM file_sync_state s
       JOIN documents d ON d.id = s.document_id
+      LEFT JOIN document_metadata dm ON dm.document_id = s.document_id
       WHERE s.collection = ?
         AND d.active = 1
         AND d.collection = s.collection
@@ -1656,7 +1659,7 @@ function getFileSyncStateMap(db: Database, collectionName: string): Map<string, 
     `);
     const map = new Map<string, FileSyncStateRow>();
     // Large-result query: use iterate() to stream rows instead of .all() materializing at once
-    for (const r of stmt.iterate(collectionName) as IterableIterator<FileSyncStateRow>) {
+    for (const r of stmt.iterate(METADATA_EXTRACTION_VERSION, collectionName) as IterableIterator<FileSyncStateRow>) {
       map.set(r.relative_path, r);
     }
     return map;
@@ -1806,8 +1809,7 @@ export async function reindexCollection(
     // Missing or stale metadata (an index from before the metadata schema, or
     // an extraction-version bump) needs the content, so such a file is read and
     // re-extracted through the hash-match branch below.
-    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size
-      && isDocumentMetadataCurrent(db, cached.document_id)) {
+    if (cached && cached.mtime_ms === Math.floor(mtimeMs) && cached.size === size && cached.metadata_current) {
       unchanged++;
       processed++;
       options?.onProgress?.({ file: relativeFile, current: processed, total });
