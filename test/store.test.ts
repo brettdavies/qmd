@@ -9,7 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec, isBun } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile, symlink } from "node:fs/promises";
+import { unlink, mkdtemp, rmdir, writeFile, rm, mkdir, rename, chmod, readFile, symlink, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -52,6 +52,8 @@ import {
   isDocid,
   syncConfigToDb,
   reindexCollection,
+  removeCollection,
+  renameCollection,
   resolveVirtualPath,
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
@@ -3017,6 +3019,165 @@ describe("Reindex Collection", () => {
     ]);
 
     await cleanupTestDb(store);
+  });
+});
+
+describe("Reindex Collection file sync state (#962)", () => {
+  const BODY_CAP = 262_144;
+
+  async function collectionDir(prefix: string): Promise<string> {
+    const dir = join(testDir, `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(dir, { recursive: true });
+    return dir;
+  }
+
+  function activeBody(store: Store, collection: string, path: string): string | undefined {
+    const row = store.db.prepare(`
+      SELECT content.doc AS body FROM documents d JOIN content ON content.hash = d.hash
+      WHERE d.collection = ? AND d.path = ? AND d.active = 1
+    `).get(collection, path) as { body: string } | undefined;
+    return row?.body;
+  }
+
+  function syncRowCount(store: Store, collection: string, path: string): number {
+    const row = store.db.prepare(`
+      SELECT COUNT(*) AS n FROM file_sync_state WHERE collection = ? AND relative_path = ?
+    `).get(collection, path) as { n: number };
+    return row.n;
+  }
+
+  test("reindex trusts an unchanged mtime and size without reading the file", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-fast-path");
+    const file = join(dir, "doc.md");
+    try {
+      // A whole-second mtime survives utimes exactly under both runtimes; a
+      // millisecond Date can come back a fraction lower through Node's seconds.
+      const mtime = new Date("2026-01-02T03:04:05Z");
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, mtime, mtime);
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Different bytes of the same size, with the mtime put back.
+      await writeFile(file, "# A\n\nbravo\n");
+      await utimes(file, mtime, mtime);
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result).toMatchObject({ indexed: 0, updated: 0, unchanged: 1 });
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("reindex does not read an unchanged file", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-no-read");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      // Stat still works on an unreadable file; a read would fail with EACCES.
+      await chmod(file, 0o000);
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.skippedFiles).toEqual([]);
+      expect(result).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+      expect(activeBody(store, "notes", "doc.md")).toContain("alpha");
+    } finally {
+      await chmod(file, 0o644);
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("files over 10 MB are skipped with FILE_TOO_LARGE and not indexed", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-too-large");
+    try {
+      await writeFile(join(dir, "big.md"), "a".repeat(10 * 1024 * 1024 + 1));
+      await writeFile(join(dir, "small.md"), "# Small\n\nfits\n");
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.indexed).toBe(1);
+      expect(result.skippedFiles).toEqual([{ file: "big.md", code: "FILE_TOO_LARGE" }]);
+      const rows = store.db.prepare(`SELECT COUNT(*) AS n FROM documents WHERE collection = ? AND path = ?`)
+        .get("notes", "big.md") as { n: number };
+      expect(rows.n).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("a previously indexed file that becomes empty is deactivated", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-emptied");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      await writeFile(file, "");
+
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(activeBody(store, "notes", "doc.md")).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("deleting an indexed file removes its sync row on the next reindex", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-deleted");
+    try {
+      await writeFile(join(dir, "doc.md"), "# A\n\nalpha\n");
+      await writeFile(join(dir, "keep.md"), "# B\n\nbravo\n");
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(1);
+      await rm(join(dir, "doc.md"));
+
+      const result = await reindexCollection(store, dir, "**/*.md", "notes");
+      expect(result.removed).toBe(1);
+      expect(syncRowCount(store, "notes", "doc.md")).toBe(0);
+      expect(syncRowCount(store, "notes", "keep.md")).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("searchFTS returns at most 256 KiB of a document body", async () => {
+    const store = await createTestStore();
+    try {
+      const body = "# Long\n\nzebracap " + "x".repeat(300 * 1024);
+      await insertTestDocument(store.db, "docs", { name: "long", body, displayPath: "long.md" });
+
+      const results = store.searchFTS("zebracap", 5);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.body!.length).toBe(BODY_CAP);
+      expect(results[0]!.body).toBe(body.slice(0, BODY_CAP));
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("searchVec returns at most 256 KiB of a document body", async () => {
+    const store = await createTestStore();
+    try {
+      const body = "# Long\n\nvector cap " + "y".repeat(300 * 1024);
+      const hash = await hashContent(body);
+      await insertTestDocument(store.db, "docs", { name: "long", body, hash, displayPath: "long.md" });
+      store.ensureVecTable(3);
+      store.insertEmbedding(hash, 0, 0, new Float32Array([1, 0, 0]), "cap-model", new Date().toISOString());
+
+      const results = await store.searchVec("q", "cap-model", 5, undefined, undefined, [1, 0, 0]);
+      expect(results).toHaveLength(1);
+      expect(results[0]!.body!.length).toBe(BODY_CAP);
+      expect(results[0]!.body).toBe(body.slice(0, BODY_CAP));
+    } finally {
+      await cleanupTestDb(store);
+    }
   });
 });
 
