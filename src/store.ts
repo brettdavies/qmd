@@ -1695,7 +1695,7 @@ function deleteFileSyncStateForCollection(db: Database, collectionName: string, 
 /**
  * Maximum file size to index — prevents OOM on accidental binary inclusion.
  */
-const REINDEX_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+export const REINDEX_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 /**
  * Deactivate a previously indexed file that can no longer be indexed (it

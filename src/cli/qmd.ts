@@ -81,6 +81,7 @@ import {
   createStore,
   getDefaultDbPath,
   reindexCollection,
+  REINDEX_MAX_FILE_SIZE,
   generateEmbeddings,
   maybeAdoptLegacyEmbeddingFingerprint,
   syncConfigToDb,
@@ -1974,6 +1975,14 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
     if (!isPathInsideDir(resolvedPwd, filepath)) {
       processed++;
       skippedFiles.push({ file: relativeFile, code: "OUTSIDE_COLLECTION" });
+      progress.set((processed / total) * 100);
+      continue;
+    }
+    let tooLarge = false;
+    try { tooLarge = statSync(filepath).size > REINDEX_MAX_FILE_SIZE; } catch { /* the read below reports it */ }
+    if (tooLarge) {
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: "FILE_TOO_LARGE" });
       progress.set((processed / total) * 100);
       continue;
     }
