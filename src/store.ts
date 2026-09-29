@@ -134,6 +134,13 @@ export function splitGlobMask(mask: string): string[] {
 }
 
 export const DEFAULT_MULTI_GET_MAX_BYTES = 64 * 1024; // 64KB
+
+/**
+ * Characters of a document body that search results, the vector body lookup
+ * and getHashesForEmbedding return (SQLite's substr counts characters), so one
+ * very large document cannot put its whole text on the heap per result.
+ */
+const BODY_CAP_CHARS = 262_144;
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 export const DEFAULT_EMBED_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes; see EmbedOptions.maxDurationMs
@@ -4476,7 +4483,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      substr(content.doc, 1, 262144) as body,
+      substr(content.doc, 1, ${BODY_CAP_CHARS}) as body,
       d.hash,
       fm.bm25_score,
       dm.metadata_json
@@ -4724,9 +4731,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   const scan = knnVecScanner(db, collectionIds !== undefined, filter);
   const resolve = vecDocumentResolver(db, filter);
   const queryVec = new Float32Array(embedding);
-  // Bodies are capped at 256 KiB, as in searchFTS, so a large document cannot
+  // Bodies are capped at BODY_CAP_CHARS, as in searchFTS, so a large document cannot
   // put its whole text on the heap for each result.
-  const bodyOf = db.prepare(`SELECT substr(doc, 1, 262144) AS doc FROM content WHERE hash = ?`);
+  const bodyOf = db.prepare(`SELECT substr(doc, 1, ${BODY_CAP_CHARS}) AS doc FROM content WHERE hash = ?`);
 
   // Each target yields its own nearest `limit` documents (or all it holds), so
   // merging them by distance gives the scope's exact nearest `limit`. Ties go
@@ -4782,7 +4789,7 @@ export function getHashesForEmbedding(db: Database, model: string = DEFAULT_EMBE
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
-    SELECT d.hash, substr(c.doc, 1, 262144) as body, MIN(d.path) as path
+    SELECT d.hash, substr(c.doc, 1, ${BODY_CAP_CHARS}) as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN (
