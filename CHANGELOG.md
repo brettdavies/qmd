@@ -39,6 +39,21 @@
   #815 (thanks @fxstein)
 - Avoid a redundant runtime process on packaged CLI calls where the launcher is
   already running under its selected Node or Bun runtime. #923 (thanks @ilepn)
+- `qmd update` no longer reads files whose modification time and size match
+  the last pass (tracked in a new `file_sync_state` table), so re-indexing an
+  unchanged collection takes seconds. A cached entry counts only while its
+  document is still active at that path with that content, so a collection
+  removed and added back is re-indexed, while a renamed one keeps its entries;
+  files with missing or outdated metadata are still re-extracted. `qmd update`
+  and `qmd collection add` skip files over 10 MB with `FILE_TOO_LARGE`, and
+  `qmd update` deactivates a previously indexed file that becomes empty or is
+  over 10 MB, including one indexed by an earlier release. #962 (thanks
+  @rikvanriel)
+- Search results carry at most the first 262,144 characters of each document
+  body (`qmd search --full`, MCP results, keyword and vector hits), which
+  bounds memory on indexes with very large documents. A match past that point
+  is still found, but its snippet, and the passage the reranker scores, come
+  from the start of the document. #962 (thanks @rikvanriel)
 
 ## [2.8.3] - 2026-08-16
 
