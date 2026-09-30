@@ -24,7 +24,7 @@
   `limit * 10` candidate window (#922). The scope is now applied to the full
   FTS5 match set, materialized once, so `search -c <collection>` is exact for
   common terms; unscoped search keeps its early-terminating plan. Builds on
-  the approach in #918.
+  the approach in #918 (thanks @fxstein). #953 (thanks @Mr-Beasley)
 
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
@@ -70,6 +70,12 @@
   existing caches need no rebuild. Repeated lex lines used to count more than
   once in the rank fusion, so result order can shift slightly. (#921)
   #1000 (thanks @ParkerRex)
+- Structured searches over several collections (`qmd query` with
+  `lex:`/`vec:`/`hyde:` lines, the MCP `query` tool, SDK `queries`) run one
+  search per line over the whole collection list, a keyword search for a
+  `lex:` line and a vector search for a `vec:` or `hyde:` line, and fuse one
+  ranked list per search. Rankings no longer depend on the order the
+  collections are named. #946 (thanks @shalom-t), #1009 (thanks @xidus90)
 
 ## [2.8.3] - 2026-08-16
 
