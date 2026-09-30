@@ -119,6 +119,7 @@
   to the tail, one chunk per short transaction, so it never holds the write
   lock for long and an interrupted run leaves a consistent table. The cleanup
   output and `qmd cleanup --dry-run` report the chunk counts.
+  #937 (thanks @brettdavies)
 
 ## [2.8.3] - 2026-08-16
 
