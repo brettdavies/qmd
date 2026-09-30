@@ -4353,12 +4353,6 @@ function compareFilepaths(a: { filepath: string }, b: { filepath: string }): num
 
 export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string | readonly string[], filter?: MetadataFilter): SearchResult[] {
   const names = scopedCollectionNames(collectionName);
-  // Search each requested collection before merging/truncating so a large
-  // unrelated collection cannot occupy global top-k and starve the rest (#775).
-  if (names && names.length > 1) {
-    return mergeSearchResultsByScore(names.map(name => searchFTS(db, query, limit, name, filter)), limit);
-  }
-  const collectionFilter = names?.[0];
 
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
@@ -4377,7 +4371,10 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // the window (#922). MATERIALIZED keeps the planner from flattening the CTE
   // and folding the filter back into the MATCH. The set is corpus-bounded:
   // at most one row per matching document.
-  const scoped = Boolean(collectionFilter || filter);
+  // Because the scope sees every match, one query over the whole collection
+  // list returns what a query per collection merged by score would (#775):
+  // a large collection can no longer crowd the others out of a window.
+  const scoped = Boolean(names || filter);
 
   let sql = `
     WITH fts_matches AS ${scoped ? "MATERIALIZED " : ""}(
@@ -4401,9 +4398,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     WHERE d.active = 1
   `;
 
-  if (collectionFilter) {
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionFilter));
+  if (names) {
+    sql += ` AND d.collection IN (SELECT value FROM json_each(?))`;
+    params.push(JSON.stringify(names));
   }
 
   if (filter) {
@@ -4414,8 +4411,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     params.push(...compiledFilter.params);
   }
 
-  // bm25 lower is better; sort ascending.
-  sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
+  // bm25 lower is better; sort ascending, ties by filepath as in
+  // mergeSearchResultsByScore.
+  sql += ` ORDER BY fm.bm25_score ASC, filepath ASC LIMIT ?`;
   params.push(limit);
 
   const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number; metadata_json: string | null }[];

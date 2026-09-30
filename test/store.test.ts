@@ -3596,6 +3596,43 @@ describe("Collection-scoped keyword search", () => {
     }
   });
 
+  test("searchFTS over several collections runs one keyword query and returns the same results", async () => {
+    const store = await createTestStore();
+    try {
+      const { smallA, smallB } = await crowdedCollections(store, 40);
+      const scope = ["crowd-large", smallA, smallB];
+      const perCollection = scope.flatMap(name => store.searchFTS("zebra", 5, name))
+        .sort((a, b) => b.score - a.score || (a.filepath < b.filepath ? -1 : a.filepath > b.filepath ? 1 : 0))
+        .slice(0, 5);
+      // Counts the keyword queries the scoped search runs.
+      let ftsQueries = 0;
+      const counting: Database = {
+        prepare: (sql: string) => {
+          const real = store.db.prepare(sql);
+          if (!sql.includes("documents_fts MATCH")) return real;
+          return {
+            ...real,
+            run: real.run.bind(real),
+            get: real.get.bind(real),
+            iterate: real.iterate.bind(real),
+            all: (...params: Parameters<typeof real.all>) => { ftsQueries++; return real.all(...params); },
+          };
+        },
+        transaction: (fn) => store.db.transaction(fn),
+        exec: (sql: string) => store.db.exec(sql),
+        loadExtension: (path: string) => store.db.loadExtension(path),
+        close: () => store.db.close(),
+      };
+
+      const { searchFTS } = await import("../src/store.js");
+      const results = searchFTS(counting, "zebra", 5, scope);
+      expect(ftsQueries).toBe(1);
+      expect(results.map(r => r.filepath)).toEqual(perCollection.map(r => r.filepath));
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("structuredSearch over two crowded-out collections returns a match from each", async () => {
     const store = await createTestStore();
     try {
