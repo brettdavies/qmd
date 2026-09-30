@@ -35,7 +35,7 @@
   so search went empty and a `qmd cleanup` before the drive came back deleted
   the rows for good. The collection is now reported as not found and its index
   is left unchanged. Permission and I/O errors still fail with their original
-  cause. (#989)
+  cause (#989). #990 (thanks @ParkerRex)
 - Embedding generation and legacy fingerprint adoption now tokenize documents
   with the store-selected embedding model instead of the global default. This
   keeps chunk boundaries aligned with the model that creates and verifies the
@@ -106,7 +106,7 @@
   admits however many chunks it admits, and a vector search fills its limit
   even when one long document holds all of the nearest chunks. Downgrading
   to an older qmd afterwards needs `qmd embed -f`, and a `qmd mcp` server
-  started before the upgrade must be restarted.
+  started before the upgrade must be restarted. #983 (thanks @brettdavies)
 
 ## [2.8.3] - 2026-08-16
 
