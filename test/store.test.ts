@@ -4838,7 +4838,7 @@ describe("Vector Search collection filter", () => {
 
     // Replays another process's orphaned-content cleanup landing between
     // document resolution and the body read.
-    const bodySql = "SELECT doc FROM content WHERE hash = ?";
+    const bodySql = "SELECT substr(doc, 1, 262144) AS doc FROM content WHERE hash = ?";
     const racing: Database = {
       prepare: (sql: string) => {
         const statement = store.db.prepare(sql);
