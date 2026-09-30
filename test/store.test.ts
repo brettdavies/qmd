@@ -3559,6 +3559,30 @@ describe("Reindex Collection file sync state (#962)", () => {
     }
   });
 
+  test("after #983's atomic collection rename the new name takes the fast path at once", async () => {
+    const store = await createTestStore();
+    const dir = await collectionDir("sync-atomic-rename");
+    const file = join(dir, "doc.md");
+    try {
+      await writeFile(file, "# A\n\nalpha\n");
+      await utimes(file, new Date("2026-01-02T03:04:05Z"), new Date("2026-01-02T03:04:05Z"));
+      await reindexCollection(store, dir, "**/*.md", "notes");
+      renameCollection(store.db, "notes", "archive");
+      expect(syncRowCount(store, "archive", "doc.md")).toBe(1);
+
+      // The first pass under the new name would report EACCES if it read the file.
+      await chmod(file, 0o000);
+      const first = await reindexCollection(store, dir, "**/*.md", "archive");
+      expect(first.skippedFiles).toEqual([]);
+      expect(first).toMatchObject({ indexed: 0, updated: 0, unchanged: 1, removed: 0 });
+      expect(activeBody(store, "archive", "doc.md")).toContain("alpha");
+    } finally {
+      await chmod(file, 0o644);
+      await rm(dir, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
   test("searchFTS returns at most 256 KiB of a document body", async () => {
     const store = await createTestStore();
     try {
