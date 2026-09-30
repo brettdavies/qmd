@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "vitest";
-import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir } from "fs/promises";
+import { chmod, copyFile, mkdtemp, rm, writeFile, mkdir, rename } from "fs/promises";
 import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
@@ -1420,6 +1420,37 @@ describe("qmd update stale vector rows", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("update leaves a collection whose directory is missing with its documents and vectors", async () => {
+    const env = await createIsolatedTestEnv("missing-root");
+    const root = join(testDir, `missing-root-${testCounter}`);
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "kept.md"), "# Kept\n\nstill here\n");
+    const add = await runQmd(["collection", "add", root, "--name", "mounted"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(add.exitCode).toBe(0);
+
+    const store = createStore(env.dbPath);
+    try {
+      const { hash } = store.db.prepare(`SELECT hash FROM documents WHERE path = 'kept.md'`).get() as { hash: string };
+      store.ensureVecTable(3);
+      store.insertEmbedding(hash, 0, 0, new Float32Array([1, 2, 3]), "test", new Date().toISOString());
+    } finally {
+      store.close();
+    }
+    await rename(root, `${root}-unmounted`);
+
+    const update = await runQmd(["update"], { dbPath: env.dbPath, configDir: env.configDir });
+    expect(update.exitCode).toBe(0);
+
+    const db = openDatabase(env.dbPath);
+    try {
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM ${VEC_ROWS_TABLE}`).get()).toEqual({ c: 1 });
+      expect(db.prepare(`SELECT active FROM documents WHERE path = 'kept.md'`).get()).toEqual({ active: 1 });
+    } finally {
+      db.close();
+    }
+    expect(update.stderr).toContain("Collection root not found");
   });
 
   test("a collection that gains an already-embedded document receives its vector rows at the end of update", async () => {
