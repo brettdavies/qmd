@@ -28,6 +28,9 @@ import YAML from "yaml";
 
 export type MetadataScalar = string | number | boolean;
 
+/** The stored type of one metadata value. Arrays are homogeneous, so a key holds one type per document. */
+export type MetadataValueType = "string" | "number" | "boolean";
+
 export type MetadataScalarArray =
   | readonly string[]
   | readonly number[]

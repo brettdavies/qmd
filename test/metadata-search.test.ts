@@ -22,7 +22,7 @@ import {
 } from "../src/store.js";
 import { replaceDocumentMetadata, syncDocumentMetadata } from "../src/metadata-store.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "../src/metadata.js";
-import type { MetadataFilter } from "../src/metadata-filter.js";
+import { parseMetadataFilter, type MetadataFilter } from "../src/metadata-filter.js";
 
 let testDir: string;
 let store: Store;
@@ -71,7 +71,7 @@ describe("searchFTS with metadata filter", () => {
     expect(unfiltered.length).toBe(3);
 
     const filtered = searchFTS(store.db, "authentication", 10, undefined, {
-      key: "status", operator: "eq", value: "published",
+      field: "status", operator: "eq", value: "published",
     });
     expect(filtered.map(r => r.displayPath)).toEqual(["notes/published.md"]);
     expect(filtered[0]!.metadata).toEqual({ status: "published" });
@@ -95,7 +95,7 @@ describe("searchFTS with metadata filter", () => {
 
     // An unprocessed document must not satisfy `exists: false`.
     const filtered = searchFTS(store.db, "common", 10, undefined, {
-      key: "status", operator: "exists", value: false,
+      field: "status", operator: "exists", value: false,
     });
     expect(filtered.map(r => r.displayPath)).toEqual(["notes/extracted.md"]);
 
@@ -110,7 +110,7 @@ describe("searchFTS with metadata filter", () => {
     await insertDoc("other", "d.md", "# D\n\nshared topic", { status: "published" });
 
     const filtered = searchFTS(store.db, "shared", 10, ["notes", "docs"], {
-      key: "status", operator: "eq", value: "published",
+      field: "status", operator: "eq", value: "published",
     });
     expect(filtered.map(r => r.displayPath).sort()).toEqual(["docs/b.md", "notes/a.md"]);
   });
@@ -129,12 +129,12 @@ describe("searchFTS with metadata filter", () => {
     const filter: MetadataFilter = {
       operator: "and",
       operands: [
-        { key: "topics", operator: "all", value: ["typescript", "programming"] },
+        { field: "topics", operator: "all", value: ["typescript", "programming"] },
         {
           operator: "or",
           operands: [
-            { key: "status", operator: "eq", value: "published" },
-            { key: "priority", operator: "gte", value: 3 },
+            { field: "status", operator: "eq", value: "published" },
+            { field: "priority", operator: "gte", value: 3 },
           ],
         },
       ],
@@ -151,7 +151,7 @@ describe("searchFTS with metadata filter", () => {
     }
 
     const filtered = searchFTS(store.db, "repeated keyword", 5, undefined, {
-      key: "status", operator: "eq", value: "published",
+      field: "status", operator: "eq", value: "published",
     });
     expect(filtered.map(r => r.displayPath)).toEqual(["notes/doc-0.md"]);
   });
@@ -182,10 +182,41 @@ describe("searchVec with metadata filter", () => {
 
     const filtered = await searchVec(
       store.db, "q", model, 10, undefined, undefined, queryEmbedding, undefined,
-      { key: "status", operator: "eq", value: "published" },
+      { field: "status", operator: "eq", value: "published" },
     );
     expect(filtered.map(r => r.displayPath)).toEqual(["notes/far-published.md"]);
     expect(filtered[0]!.metadata).toEqual({ status: "published" });
+  });
+
+  test("a near-ceiling filter fits both vector lookup paths and still excludes shared nonmatching copies", async () => {
+    store.ensureVecTable(3);
+    const body = "# Book\n\nDeterministic vector fixture";
+    const { hash } = await insertDoc("notes", "published.md", body, { eligible: true });
+    await insertDoc("notes", "draft-copy.md", body, { eligible: false });
+    const timestamp = new Date().toISOString();
+
+    store.db.transaction(() => {
+      for (let sequence = 0; sequence < 20_000; sequence++) {
+        insertEmbedding(store.db, hash, sequence, 0, new Float32Array([1, sequence / 20_001, 0]), model, timestamp, 20_001);
+      }
+    })();
+
+    // 256 nodes, 64 distinct members per wide leaf: a valid filter with
+    // 31,490 bindings. Candidate IDs must not exhaust the remaining budget.
+    const members = Array.from({ length: 64 }, (_, index) => `value-${index}`);
+    const leaves = Array.from({ length: 246 }, () => ({ field: "absent", operator: "all", value: members }));
+    const groups = Array.from({ length: 8 }, (_, index) => ({ operator: "or", operands: leaves.slice(index * 32, (index + 1) * 32) }));
+    const metadataFilter = parseMetadataFilter({ operator: "or", operands: [{ field: "eligible", operator: "eq", value: true }, ...groups] });
+
+    // At 20,000 eligible chunks the exact path returns up to limit * 3 IDs.
+    const exactResults = await searchVec(store.db, "q", model, 500, "notes", undefined, queryEmbedding, undefined, metadataFilter);
+    expect(exactResults.map(result => result.displayPath)).toEqual(["notes/published.md"]);
+
+    // The extra chunk crosses into capped global lookup. Its 4,096 candidate
+    // IDs used to push the final document lookup past Node's variable limit.
+    insertEmbedding(store.db, hash, 20_000, 0, new Float32Array([1, 1, 0]), model, timestamp, 20_001);
+    const fallbackResults = await searchVec(store.db, "q", model, 137, "notes", undefined, queryEmbedding, undefined, metadataFilter);
+    expect(fallbackResults.map(result => result.displayPath)).toEqual(["notes/published.md"]);
   });
 
   test("returns empty when no documents are eligible", async () => {
@@ -194,7 +225,7 @@ describe("searchVec with metadata filter", () => {
 
     const filtered = await searchVec(
       store.db, "q", model, 10, undefined, undefined, queryEmbedding, undefined,
-      { key: "status", operator: "eq", value: "published" },
+      { field: "status", operator: "eq", value: "published" },
     );
     expect(filtered).toEqual([]);
   });
@@ -218,7 +249,7 @@ describe("searchVec with metadata filter", () => {
 
     const filtered = await searchVec(
       store.db, "q", model, 10, undefined, undefined, queryEmbedding, undefined,
-      { key: "status", operator: "eq", value: "published" },
+      { field: "status", operator: "eq", value: "published" },
     );
     expect(filtered.map(r => r.displayPath)).toEqual(["notes/published-copy.md"]);
   });
@@ -230,7 +261,7 @@ describe("searchVec with metadata filter", () => {
 
     const filtered = await searchVec(
       store.db, "q", model, 10, "docs", undefined, queryEmbedding, undefined,
-      { key: "status", operator: "eq", value: "published" },
+      { field: "status", operator: "eq", value: "published" },
     );
     expect(filtered.map(r => r.displayPath)).toEqual(["docs/b.md"]);
   });
@@ -248,7 +279,7 @@ describe("structuredSearch with metadata filter", () => {
     syncDocumentMetadata(store.db, draftId, draftBody, "draft.md");
 
     const results = await structuredSearch(store, [{ type: "lex", query: "structured keyword" }], {
-      filter: { key: "status", operator: "eq", value: "published" },
+      filter: { field: "status", operator: "eq", value: "published" },
       skipRerank: true,
     });
 

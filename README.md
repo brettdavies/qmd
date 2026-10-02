@@ -94,7 +94,8 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `query` — Search with typed sub-queries (`lex`/`vec`/`hyde`), combined via RRF + reranking
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
-- `status` — Index health and collection info
+- `status` — Index health and collection info, including each collection's top metadata keys
+- `metadata` — Discover metadata keys, types, and value counts to filter on
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -152,6 +153,7 @@ runs in a container and a liveness probe connects from a non-loopback address.
 The HTTP server exposes two endpoints:
 - `POST /mcp` — MCP Streamable HTTP (JSON responses, stateless)
 - `POST /query` (alias `/search`) — structured search without the MCP protocol. Accepts the same optional `filter` object as the `query` tool (invalid filters return `400`); see [Metadata Filtering](#metadata-filtering)
+- `POST /metadata` — metadata discovery without the MCP protocol. Same body as the `metadata` tool (invalid filters return `400`); see [Metadata Discovery](#metadata-discovery)
 - `GET /health` — liveness check with uptime
 
 
@@ -201,6 +203,15 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 | `multi_get` | `maxBytes` | number | Skip files larger than N (default 10240) |
 | `multi_get` | `maxLines` | number | Limit lines per file |
 | `multi_get` | `lineNumbers` | boolean | Prefix lines with numbers (default **true**) |
+| `metadata` | `collections` | string[] | Restrict discovery to collection names (default: the collections `query` searches) |
+| `metadata` | `match` | object | Report only metadata entries matching this condition (same AST as `filter`, with `field` naming the entry's `key` or `value`) |
+| `metadata` | `filter` | object | Count only documents matching this filter (same AST as `query`) |
+| `metadata` | `keyLimit` | number | Keys reported (default 50). `totalKeys` and `remainingKeys` describe the rest |
+| `metadata` | `keyOffset` | number | Keys skipped before the window, in report order (default 0) |
+| `metadata` | `valueLimit` | number | Values reported per key and type (default 10). `remainingValues` reports the rest |
+| `metadata` | `valueOffset` | number | Values skipped per key and type before the window, in `sort` order (default 0) |
+| `metadata` | `sort` | string | `count` (default) or `value` |
+| `metadata` | `minCount` | number | Hide values held by fewer documents (default 1) |
 
 Unknown parameters are silently ignored (not rejected) — double-check names if
 results seem unscoped. The HTTP `/query` and `/search` endpoints return
@@ -302,8 +313,8 @@ const published = await store.search({
   filter: {
     operator: "and",
     operands: [
-      { key: "topics", operator: "all", value: ["typescript"] },
-      { key: "status", operator: "ne", value: "draft" },
+      { field: "topics", operator: "all", value: ["typescript"] },
+      { field: "status", operator: "ne", value: "draft" },
     ],
   },
 })
@@ -644,8 +655,13 @@ qmd collection rename myproject my-project
 qmd ls notes
 qmd ls notes/subfolder
 
-# Show collection details (path, glob mask, include status, context count)
+# Show collection details (path, glob mask, include status, context count, top metadata keys)
 qmd collection show notes
+
+# Discover metadata keys, types, and value counts (see Metadata Discovery)
+qmd collection metadata notes
+qmd collection metadata notes --match '{"field":"key","operator":"eq","value":"topics"}'
+qmd collection metadata notes --match '{"field":"value","operator":"eq","value":"docs-team"}'
 
 # Include or exclude a collection from default (unscoped) queries
 qmd collection include notes
@@ -940,24 +956,25 @@ qmd:
 
 Supported values are strings, numbers, booleans, and flat homogeneous arrays of one of those. Nested objects, nulls, empty arrays, and mixed-type arrays are rejected (the document still indexes; it is excluded from filtered search until corrected). Metadata keys are user-defined data — `tags`, `topics`, and `labels` are all ordinary keys with no special semantics.
 
-Every search surface (CLI, SDK, MCP, HTTP) accepts the same recursive filter, a JSON AST discriminated by `operator`:
+Every search surface (CLI, SDK, MCP, HTTP) accepts the same recursive filter, a JSON AST discriminated by `operator`. A condition is a predicate over one field of the document's metadata: `field` names the metadata key, `operator` says how to compare, and `value` is what to compare against:
 
 ```sh
 # One condition
 qmd search "authentication" \
-  --filter '{"key":"status","operator":"eq","value":"published"}'
+  --filter '{"field":"status","operator":"eq","value":"published"}'
 
 # Composed conditions — works with search, vsearch, and query
 qmd query "dependency injection" --filter '{
   "operator": "and",
   "operands": [
-    { "key": "topics", "operator": "all", "value": ["typescript", "programming"] },
-    { "key": "status", "operator": "nin", "value": ["draft", "archived"] },
+    { "field": "topics", "operator": "all", "value": ["typescript", "programming"] },
+    { "field": "status", "operator": "nin", "value": ["draft", "archived"] },
     { "operator": "or", "operands": [
-      { "key": "priority", "operator": "gte", "value": 3 },
-      { "key": "reviewed", "operator": "eq", "value": true }
+      { "field": "priority", "operator": "gte", "value": 3 },
+      { "field": "reviewed", "operator": "eq", "value": true }
     ] },
-    { "operator": "not", "operand": { "key": "audience", "operator": "eq", "value": "internal" } }
+    { "field": "topics", "operator": "prefix", "value": "sql", "caseInsensitive": true },
+    { "operator": "not", "operand": { "field": "audience", "operator": "eq", "value": "internal" } }
   ]
 }'
 ```
@@ -966,24 +983,209 @@ qmd query "dependency injection" --filter '{
 |------|-------|
 | Logical group | `{ "operator": "and" \| "or", "operands": […] }` |
 | Negation | `{ "operator": "not", "operand": {…} }` |
-| Comparison | `{ "key", "operator": "eq" \| "ne" \| "gt" \| "gte" \| "lt" \| "lte", "value" }` |
-| Membership | `{ "key", "operator": "in" \| "nin" \| "all", "value": […] }` |
-| Presence | `{ "key", "operator": "exists", "value": true \| false }` |
+| Comparison | `{ "field", "operator": "eq" \| "ne" \| "gt" \| "gte" \| "lt" \| "lte", "value" }` |
+| Membership | `{ "field", "operator": "in" \| "nin" \| "all", "value": […] }` |
+| Text | `{ "field", "operator": "contains" \| "prefix" \| "suffix", "value": "…" }` |
+| Type | `{ "field", "operator": "type", "value": "string" \| "number" \| "boolean" }` |
+| Presence | `{ "field", "operator": "exists", "value": true \| false }` |
+
+Any condition whose value is a string or an array of strings may add `"caseInsensitive": true`.
 
 Semantics:
 
-- Matching is typed and exact — no string/number/boolean coercion, and a type mismatch never matches (including `ne` and `nin`).
-- Array-valued metadata is a set: a condition matches when any element satisfies it, `all` requires every filter value to be present.
+- Matching is typed and exact — no string/number/boolean coercion, and a type mismatch never matches (including `ne` and `nin`). Text operators match string values only. `type` matches the stored type of a key's values, which is how a filter reaches one side of a key whose documents disagree on type.
+- Array-valued metadata is a set: a condition matches when any element satisfies it, `all` requires every filter value to be present, and `ne`/`nin` require that no element equals the operand (with at least one element of the operand's type present).
 - Missing keys do not match `ne`/`nin`; combine with `{ "operator": "exists", "value": false }` in an `or` group to include them.
+- Matching is case-sensitive unless a condition sets `caseInsensitive`, which folds ASCII letters on both sides. Non-ASCII letters compare exactly.
 - Multiple conditions require an explicit `and` group — there is no implicit AND, and no `$`-prefixed shorthand.
 
 Guarantees and limits:
 
 - Every returned result satisfies the filter, before RRF fusion and reranking.
-- Like collection filtering, highly selective filters are best-effort for top-K completeness: backends over-fetch and post-filter, so a very selective filter can return fewer than `limit` results.
+- Highly selective filters can return fewer than `limit` results. Lexical search filters a bounded over-fetch window; vector search scans the filter-eligible set exactly when it holds at most 20,000 chunk vectors, and above that over-fetches and post-filters.
 - Filtered search only considers documents whose metadata has been extracted (run `qmd update` after upgrading; `qmd status` shows the pending count).
 
 JSON output (`--format json`), the SDK, MCP structured results, and the HTTP endpoints include each result's indexed metadata.
+
+### Metadata Discovery
+
+Filtering is only useful if you know what to filter on. Discovery reports the metadata keys, types, and value counts already in the index, so a filter can be written from what is indexed instead of guessed. It reads the same tables filtering reads: no re-indexing, and every value it reports is one an `eq` filter can match.
+
+The command is one sentence: show metadata matching X for documents filtered by Y. `--filter` narrows **documents** by their metadata (same AST as search) and decides which are counted. `--match` narrows **the metadata itself** and decides which entries are reported. It takes the same AST, evaluated against each metadata entry instead of each document: a condition's `field` is `"key"` (the entry's key name) or `"value"` (its value). Every operator applies, including `type`, the text operators, `caseInsensitive`, and `and`/`or`/`not`. Only `exists` and `all` are rejected, as they have no meaning for a single entry.
+
+| `--match` | Question answered |
+|-----------|-------------------|
+| | Which keys exist, with a window of values each |
+| `{"field":"key","operator":"eq","value":"topics"}` | Everything about one key |
+| `{"field":"key","operator":"prefix","value":"mem-"}` | A family of keys |
+| `{"field":"key","operator":"in","value":["tags","topics","labels"]}` | Which of these key names exist |
+| `{"field":"value","operator":"eq","value":"docs-team"}` | Which keys hold this value |
+| `{"field":"value","operator":"prefix","value":"2025-"}` | Which keys hold values shaped like this |
+| `{"field":"value","operator":"type","value":"boolean"}` | Which keys hold booleans |
+| `and` of `key eq priority` and `value gte 3` | Values of one key above a threshold |
+| `and` of `key eq priority` and `value type number` | The numeric side of a key whose documents disagree on type |
+
+Start wide and narrow:
+
+```sh
+# Which keys does this collection use? (`qmd collection show notes` previews the top five)
+qmd collection metadata notes
+
+# Everything about one key: coverage, distinct count, top values
+qmd collection metadata notes --match '{"field":"key","operator":"eq","value":"topics"}'
+
+# Reverse lookup: which keys hold this value
+qmd collection metadata notes --match '{"field":"value","operator":"eq","value":"docs-team"}'
+
+# Values of one key matching a pattern
+qmd collection metadata notes --match '{
+  "operator": "and",
+  "operands": [
+    { "field": "key", "operator": "eq", "value": "topics" },
+    { "field": "value", "operator": "prefix", "value": "sql" }
+  ]
+}'
+
+# What remains after a filter, before committing to it in a query
+qmd collection metadata notes \
+  --match '{"field":"key","operator":"eq","value":"topics"}' \
+  --filter '{"field":"status","operator":"eq","value":"published"}'
+
+# Then search with the filter you just validated
+qmd query "dependency injection" -c notes --filter '{
+  "operator": "and",
+  "operands": [
+    { "field": "status", "operator": "eq", "value": "published" },
+    { "field": "topics", "operator": "all", "value": ["typescript"] }
+  ]
+}'
+```
+
+The drill-down prints one block per key, in coverage order:
+
+```sh
+qmd collection metadata notes
+```
+
+```
+topics  string[]  388 of 480 documents  1,204 distinct
+  typescript    140
+  sqlite         92
+  search         77
+  architecture   61
+  sqlite-vec     44
+  mcp            39
+  embeddings     35
+  agents         31
+  cli            28
+  testing        26
+1,194 more values, use --value-limit <n>, --value-offset <n>, or --all-values
+
+priority  number  205 of 480 documents  5 distinct
+  min 1  median 3  max 5
+  1 (12)  2 (40)  3 (88)  4 (50)  5 (15)
+
+reviewed  boolean  480 of 480 documents
+  true 61  false 419
+```
+
+With `--filter`, the output opens with a `filter:` line stating how many documents pass, and every coverage count is measured against that population rather than the whole collection — the numbers a filtered search would see:
+
+```sh
+qmd collection metadata notes \
+  --match '{"field":"key","operator":"eq","value":"topics"}' \
+  --filter '{"field":"status","operator":"eq","value":"published"}' \
+  --value-limit 5
+```
+
+```
+filter: 312 of 480 documents
+
+topics  string[]  260 of 312 documents  811 distinct
+  typescript    104
+  sqlite         70
+  search         58
+  architecture   40
+  mcp            31
+806 more values, use --value-limit <n>, --value-offset <n>, or --all-values
+```
+
+Two windows page the key and value lists. Each windowed list ends with the exact remainder and the flags that reach it:
+
+```sh
+--key-limit <n>      # Keys reported, in coverage order (default 50)
+--key-offset <n>     # Keys skipped before the window
+--all-keys           # Remove the key window
+--value-limit <n>    # Values reported per key and type (default 10)
+--value-offset <n>   # Values skipped per key and type, in --sort order
+--all-values         # Remove the value window
+--sort count|value   # Order values by document count (default) or by value
+--min-count <n>      # Drop values held by fewer documents
+```
+
+Omitting the collection name covers the default collections, exactly as an unscoped search does.
+
+Reading the output:
+
+- **Counts are documents, not values.** A document with `topics: [a, b]` contributes one to each. Coverage is "documents declaring this key", out of the documents the filter admits when there is one.
+- **A bare string is exactly the value.** A string whose bare form could be read as something else (`"42"`, `""`, `"a, b"`) prints as a JSON string, so paste it into a filter as the JSON string it is.
+- **Numbers report min, median, and max**, plus the enumerated values when they fit, which is enough to write a `gt`/`lt` threshold in one call.
+- **Discovery sees exactly what filtering sees.** Same extraction gate, same active-document rule, same collection scope, and every count in a result comes from one database snapshot. Documents still pending extraction are reported on stderr and excluded until `qmd update` runs.
+- **Type conflicts are reported, not resolved.** Metadata is validated one document at a time, so `priority: 3` in one file and `priority: high` in another both index, within one collection or across several. Discovery splits such a key by type, each with its own document count and (across collections) its contributing collections:
+
+```sh
+qmd collection metadata --match '{"field":"key","operator":"eq","value":"priority"}'
+```
+
+```
+priority  number | string  1,427 of 2,100 documents
+  number    223 docs  min 1  median 3  max 5               notes, work
+  string  1,204 docs  high (700), medium (380), low (124)  work
+```
+
+To report one side only, add a `type` condition on the value field. The filter that reaches exactly those documents is the same condition with the metadata key in `field`:
+
+```sh
+qmd collection metadata --match '{
+  "operator": "and",
+  "operands": [
+    { "field": "key", "operator": "eq", "value": "priority" },
+    { "field": "value", "operator": "type", "value": "number" }
+  ]
+}'
+qmd query "release checklist" --filter '{"field":"priority","operator":"type","value":"number"}'
+```
+
+`qmd collection list` names each collection's top keys, `qmd collection show <name>` details the top five with a value preview, and `qmd status` summarizes how many keys and files carry metadata.
+
+The CLI prints text and rejects unsupported format flags. Structured discovery is available through the SDK, MCP, and HTTP with the same options (`collection`, `match`, `filter`, `keyLimit`, `keyOffset`, `valueLimit`, `valueOffset`, `sort`, `minCount`) and the same result shape:
+
+```typescript
+// SDK: one flat result, keys in coverage order, each split per type
+const discovery = await store.listMetadata({
+  collection: "notes",
+  match: { field: "key", operator: "eq", value: "topics" },
+  valueLimit: 5,
+})
+discovery.documents            // active documents in scope
+discovery.totalKeys            // keys with a matching entry, before the key window
+discovery.remainingKeys        // keys after the window
+discovery.keys[0].types[0]     // { type, multiValued, documents, distinctValues, values, remainingValues, range?, collections }
+
+// Narrowed by a filter: how many documents pass, and what is left to filter on
+const published = await store.listMetadata({
+  collection: "notes",
+  filter: { field: "status", operator: "eq", value: "published" },
+})
+published.filteredDocuments    // the denominator for every coverage count in this result
+
+// Page through a wide vocabulary
+const nextPage = await store.listMetadata({ keyLimit: 50, keyOffset: 50 })
+```
+
+`filter` is a `MetadataFilter` and `match` is a `MetadataMatch`. Both are `MetadataPredicate<Condition>`, the one recursive grammar over the conditions each record admits, so a document-only condition (`exists`, `all`, or a metadata key as the `field`) is a type error in a match as well as a runtime one. An option outside its domain throws `MetadataOptionError`, and a `filter` and `match` that together bind more SQL parameters than one statement allows throw `MetadataBindingBudgetError`.
+
+The MCP `metadata` tool takes the same options with `collections` spelled as on `query`, returns the CLI text plus the result as `structuredContent`, and the MCP `status` tool lists each collection's most covered keys so an agent's first call reveals that metadata exists. `POST /metadata` accepts the same body as the tool and returns the same result (`400` on an invalid match, filter, or option).
 
 ### Output Format
 

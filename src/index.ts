@@ -73,15 +73,34 @@ import type {
   MetadataScalar,
   MetadataScalarArray,
   MetadataValue,
+  MetadataValueType,
 } from "./metadata.js";
 import {
   parseMetadataFilter,
+  parseMetadataMatch,
   MetadataFilterError,
   type MetadataFilter,
   type MetadataFilterGroup,
   type MetadataFilterNegation,
   type MetadataCondition,
+  type MetadataPredicate,
+  type MetadataPredicateGroup,
+  type MetadataPredicateNegation,
+  type MetadataMatch,
+  type MetadataEntryCondition,
+  type MetadataEntryField,
 } from "./metadata-filter.js";
+import {
+  listMetadata as storeListMetadata,
+  MetadataBindingBudgetError,
+  MetadataOptionError,
+  type ListMetadataOptions,
+  type ListMetadataResult,
+  type MetadataKeySummary,
+  type MetadataKeyTypeSummary,
+  type MetadataValueCount,
+  type MetadataKeyOverview,
+} from "./metadata-store.js";
 import {
   setConfigSource,
   loadConfig,
@@ -129,12 +148,30 @@ export type {
   MetadataScalar,
   MetadataScalarArray,
   MetadataValue,
+  MetadataValueType,
   MetadataFilter,
   MetadataFilterGroup,
   MetadataFilterNegation,
   MetadataCondition,
+  MetadataPredicate,
+  MetadataPredicateGroup,
+  MetadataPredicateNegation,
+  MetadataMatch,
+  MetadataEntryCondition,
+  MetadataEntryField,
 };
-export { parseMetadataFilter, MetadataFilterError };
+export { parseMetadataFilter, parseMetadataMatch, MetadataFilterError };
+
+// Re-export metadata discovery types (listMetadata() and status metadata keys)
+export type {
+  ListMetadataOptions,
+  ListMetadataResult,
+  MetadataKeySummary,
+  MetadataKeyTypeSummary,
+  MetadataValueCount,
+  MetadataKeyOverview,
+};
+export { MetadataBindingBudgetError, MetadataOptionError };
 
 // Re-export the internal Store type for advanced consumers
 export type { InternalStore };
@@ -302,6 +339,22 @@ export interface QMDStore {
 
   /** List all collections with document stats */
   listCollections(): Promise<{ name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[]>;
+
+  /**
+   * Discover metadata keys, types, and value counts across the documents in
+   * scope. `filter` selects which documents are counted. `match` selects
+   * which of their metadata entries are reported, with the filter grammar
+   * evaluated against each entry (a condition's `field` is the entry's `key` or
+   * `value`). Keys and values are windowed by `keyLimit`/`keyOffset` and
+   * `valueLimit`/`valueOffset`, and the result carries the totals and
+   * remainders needed to page. Every value reported is one an `eq` filter can
+   * match under the same scope, and the whole result comes from one database
+   * snapshot. Throws MetadataFilterError for an invalid predicate,
+   * MetadataOptionError for an option outside its domain, and
+   * MetadataBindingBudgetError when `filter` and `match` together bind more
+   * SQL parameters than one statement allows.
+   */
+  listMetadata(options?: ListMetadataOptions): Promise<ListMetadataResult>;
 
   /** Get names of collections included by default in queries */
   getDefaultCollectionNames(): Promise<string[]>;
@@ -510,6 +563,11 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return result;
     },
     listCollections: async () => storeListCollections(db),
+    listMetadata: async (opts) => storeListMetadata(db, {
+      ...opts,
+      match: opts?.match === undefined ? undefined : parseMetadataMatch(opts.match),
+      filter: opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter),
+    }),
     getDefaultCollectionNames: async () => {
       const collections = storeListCollections(db);
       return collections.filter(c => c.includeByDefault).map(c => c.name);
