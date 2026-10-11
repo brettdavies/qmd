@@ -6359,6 +6359,7 @@ export async function hybridQuery(
 
     // Batch embed all vector queries in a single call
     const llm = getLlm(store);
+    await llm.ready?.();
     const embedModel = llm.embedModelName ?? DEFAULT_EMBED_MODEL;
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
@@ -6619,6 +6620,7 @@ export async function vectorSearchQuery(
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
+  await getLlm(store).ready?.();
   const embedModel = getLlm(store).embedModelName ?? DEFAULT_EMBED_MODEL;
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
@@ -6761,6 +6763,7 @@ export async function structuredSearch(
     );
     if (vecSearches.length > 0) {
       const llm = getLlm(store);
+      await llm.ready?.();
       const embedModel = llm.embedModelName ?? DEFAULT_EMBED_MODEL;
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);

@@ -65,9 +65,12 @@ import {
   type EmbedProgress,
   type EmbedResult,
   type ChunkStrategy,
+  DEFAULT_EMBED_MODEL,
 } from "./store.js";
 import {
   LlamaCpp,
+  getDefaultLLM,
+  type LLM,
 } from "./llm.js";
 import type {
   DocumentMetadata,
@@ -472,7 +475,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // With QMD_REMOTE_URL, use the shared `qmd serve` models (RemoteQMD) instead of a private copy per store.
+  const llm: LLM = process.env.QMD_REMOTE_URL ? getDefaultLLM() : new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
@@ -535,7 +539,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
     searchVector: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
-      return internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, filter);
+      await llm.ready?.();
+      return internal.searchVec(q, llm.embedModelName ?? DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection, undefined, undefined, filter);
     },
     expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
